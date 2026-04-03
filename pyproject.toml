@@ -1,0 +1,26 @@
+[project]
+name = "gptforchess"
+version = "0.1.0"
+description = "General Purpose Transformer trained on chess games upwards of 1500 ELO. Additional configuration will be maintained for fine-tuning model to fit particular player play-styles"
+authors = [
+    {name = "Roshan Bellary",email = "roshan.bellary@gmail.com"}
+]
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pandas (>=3.0.1,<4.0.0)",
+    "torch (>=2.0.0)",
+    "python-chess (>=1.10.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^9.0.2"
+
