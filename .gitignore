@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+
+# Virtual environments
+.venv/
+
+# Testing
+.pytest_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDE
+.vscode/
+.idea/
+
+# Environment / secrets
+.env
+
+# Training artifacts
+runs/
+*.pt
+loss_curve.png
+
+# Claude Code
+CLAUDE.md
+
+data/

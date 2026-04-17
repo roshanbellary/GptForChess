@@ -1,7 +1,19 @@
 import math
+import os
+import shutil
+import time
 import torch
 import pytest
-from train import normalize_cp, collate_fn, build_tokenizer
+import pandas as pd
+from train import (
+    normalize_cp,
+    collate_fn,
+    build_tokenizer_from_games,
+    parse_movetext,
+    ChessPositionDataset,
+    generate_samples_stockfish_parallel,
+    material_eval,
+)
 from model import CLS_TOKEN, PAD_TOKEN
 
 
@@ -53,14 +65,211 @@ class TestCollateFn:
         assert labels.dtype == torch.float
 
 
+class TestParseMovetext:
+    def test_basic(self):
+        mt = "1. d4 d5 2. Nf3 Nf6 1-0"
+        assert parse_movetext(mt) == ["d4", "d5", "Nf3", "Nf6"]
+
+    def test_draw_result(self):
+        mt = "1. e4 e5 1/2-1/2"
+        assert parse_movetext(mt) == ["e4", "e5"]
+
+    def test_empty(self):
+        assert parse_movetext("") == []
+
+    def test_star_result(self):
+        mt = "1. d4 *"
+        assert parse_movetext(mt) == ["d4"]
+
+
 class TestBuildTokenizer:
-    def test_builds_from_csv(self):
-        tokenizer = build_tokenizer("data/games.csv")
+    def _games_from_csv(self, csv_path="data/games.csv"):
+        """Convert local CSV games to the HuggingFace row format."""
+        df = pd.read_csv(csv_path)
+        games = []
+        for _, row in df.iterrows():
+            moves_str = row.get("moves", "")
+            if not isinstance(moves_str, str) or not moves_str.strip():
+                continue
+            # Convert space-separated SAN to PGN movetext
+            sans = moves_str.split()
+            parts = []
+            for i, san in enumerate(sans):
+                if i % 2 == 0:
+                    parts.append(f"{i // 2 + 1}.")
+                parts.append(san)
+            games.append({"movetext": " ".join(parts)})
+        return games
+
+    def test_builds_from_games(self):
+        games = self._games_from_csv()
+        tokenizer = build_tokenizer_from_games(games)
         assert tokenizer.language_size > 0
         assert CLS_TOKEN in tokenizer.symbol_to_token
         assert PAD_TOKEN in tokenizer.symbol_to_token
 
     def test_can_encode_common_moves(self):
-        tokenizer = build_tokenizer("data/games.csv")
+        games = self._games_from_csv()
+        tokenizer = build_tokenizer_from_games(games)
         for move in ["e4", "d4", "Nf3", "e5"]:
             assert move in tokenizer.symbol_to_token
+
+
+# ---------------------------------------------------------------------------
+# Helpers shared by parallel-sampler tests.
+# ---------------------------------------------------------------------------
+
+def _games_from_csv(csv_path="data/games.csv", limit=500):
+    """Load a subset of local CSV games and convert to HF-row format."""
+    df = pd.read_csv(csv_path).head(limit)
+    games = []
+    for _, row in df.iterrows():
+        moves_str = row.get("moves", "")
+        if not isinstance(moves_str, str) or not moves_str.strip():
+            continue
+        sans = moves_str.split()
+        parts = []
+        for i, san in enumerate(sans):
+            if i % 2 == 0:
+                parts.append(f"{i // 2 + 1}.")
+            parts.append(san)
+        games.append({"movetext": " ".join(parts)})
+    return games
+
+
+def _canonicalize(samples):
+    """Convert a list of (token_ids, score) into a sorted, hashable form
+    so two sample sets produced in different orders can be compared."""
+    return sorted((tuple(t), round(s, 9)) for t, s in samples)
+
+
+@pytest.fixture(scope="module")
+def shared_tokenizer():
+    """Module-scoped tokenizer trained on a subset of games.csv."""
+    games = _games_from_csv(limit=500)
+    return build_tokenizer_from_games(games)
+
+
+@pytest.fixture(scope="module")
+def shared_games():
+    """A small set of real games reused across parallel tests."""
+    return _games_from_csv(limit=30)
+
+
+class TestParallelSampleGeneration:
+    """Tests for generate_samples_stockfish_parallel.
+
+    The first three tests use engine_path=None so they exercise the full
+    multiprocessing machinery (spawn, pool init, imap_unordered) without
+    requiring a Stockfish binary — useful when this runs in CI.
+
+    The Stockfish-backed tests are skipped when the binary is absent.
+    """
+
+    def test_parallel_produces_samples(self, shared_tokenizer, shared_games):
+        """Smoke test: pool spins up, workers run, samples come back."""
+        samples = generate_samples_stockfish_parallel(
+            shared_games,
+            shared_tokenizer,
+            num_workers=4,
+            engine_path=None,  # material_eval fallback, no Stockfish needed
+            max_positions_per_game=5,
+        )
+        assert len(samples) > 0, "parallel pool produced no samples"
+        for token_ids, score in samples:
+            assert isinstance(token_ids, list)
+            assert len(token_ids) >= 2  # CLS + at least one move
+            assert all(isinstance(t, int) for t in token_ids)
+            assert -1.0 <= score <= 1.0
+
+    def test_parallel_matches_serial(self, shared_tokenizer, shared_games):
+        """Parallel output is identical to serial output (same eval, same seeds)."""
+        serial_ds = ChessPositionDataset(
+            shared_games,
+            shared_tokenizer,
+            eval_fn=material_eval,
+            max_positions_per_game=5,
+        )
+        parallel = generate_samples_stockfish_parallel(
+            shared_games,
+            shared_tokenizer,
+            num_workers=4,
+            engine_path=None,
+            max_positions_per_game=5,
+        )
+        assert _canonicalize(serial_ds.samples) == _canonicalize(parallel)
+
+    def test_worker_count_invariant(self, shared_tokenizer, shared_games):
+        """Different worker counts must produce the same sample set."""
+        s1 = generate_samples_stockfish_parallel(
+            shared_games, shared_tokenizer,
+            num_workers=1, engine_path=None, max_positions_per_game=5,
+        )
+        s8 = generate_samples_stockfish_parallel(
+            shared_games, shared_tokenizer,
+            num_workers=8, engine_path=None, max_positions_per_game=5,
+        )
+        assert _canonicalize(s1) == _canonicalize(s8)
+
+    @pytest.mark.skipif(
+        shutil.which("stockfish") is None,
+        reason="Stockfish binary not on PATH",
+    )
+    def test_parallel_stockfish_end_to_end(self, shared_tokenizer, shared_games):
+        """End-to-end parallel run with real Stockfish at shallow depth."""
+        samples = generate_samples_stockfish_parallel(
+            shared_games[:8],
+            shared_tokenizer,
+            num_workers=4,
+            stockfish_depth=4,  # shallow for test speed
+            max_positions_per_game=3,
+        )
+        assert len(samples) > 0
+        for token_ids, score in samples:
+            assert len(token_ids) >= 2
+            assert -1.0 <= score <= 1.0
+
+    @pytest.mark.skipif(
+        shutil.which("stockfish") is None,
+        reason="Stockfish binary not on PATH",
+    )
+    def test_parallel_faster_than_serial(self, shared_tokenizer):
+        """Parallel (4 workers) must be meaningfully faster than serial (1 worker).
+
+        Uses real Stockfish at depth 12 across ~300 positions. Smaller
+        workloads are dominated by spawn startup (~2-3s per worker for the
+        heavy import chain) and produce misleading numbers.
+
+        Gated behind RUN_PERF_TESTS=1 because it takes ~25-30s.
+        """
+        if os.getenv("RUN_PERF_TESTS") != "1":
+            pytest.skip("set RUN_PERF_TESTS=1 to run the perf comparison")
+
+        games = _games_from_csv(limit=100)
+
+        t0 = time.time()
+        _ = generate_samples_stockfish_parallel(
+            games, shared_tokenizer,
+            num_workers=1, stockfish_depth=12, max_positions_per_game=3,
+            chunksize=2, progress_every=0,
+        )
+        serial_time = time.time() - t0
+
+        t0 = time.time()
+        _ = generate_samples_stockfish_parallel(
+            games, shared_tokenizer,
+            num_workers=4, stockfish_depth=12, max_positions_per_game=3,
+            chunksize=2, progress_every=0,
+        )
+        parallel_time = time.time() - t0
+
+        speedup = serial_time / parallel_time
+        print(
+            f"\n  serial(1w)={serial_time:.2f}s  parallel(4w)={parallel_time:.2f}s  "
+            f"speedup={speedup:.2f}x"
+        )
+        # Conservative floor: 4 workers should be at least 1.4x faster
+        # than 1 worker at this scale (expected ~1.6-2.0x from benchmarks).
+        # At full training scale spawn overhead amortizes to zero and the
+        # speedup approaches N_workers.
+        assert speedup > 1.4, f"expected >1.4x speedup, got {speedup:.2f}x"

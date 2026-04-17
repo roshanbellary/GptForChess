@@ -6,11 +6,15 @@ authors = [
     {name = "Roshan Bellary",email = "roshan.bellary@gmail.com"}
 ]
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.11,<4.0"
 dependencies = [
     "pandas (>=3.0.1,<4.0.0)",
     "torch (>=2.0.0)",
-    "python-chess (>=1.10.0)"
+    "python-chess (>=1.10.0)",
+    "datasets (>=3.0.0)",
+    "tensorboard (>=2.14.0)",
+    "matplotlib (>=3.8.0)",
+    "vastai (>=1.0.3,<2.0.0)",
 ]
 
 
@@ -19,7 +23,7 @@ requires = ["poetry-core>=2.0.0,<3.0.0"]
 build-backend = "poetry.core.masonry.api"
 
 [tool.pytest.ini_options]
-pythonpath = ["."]
+pythonpath = ["src"]
 
 [tool.poetry.group.dev.dependencies]
 pytest = "^9.0.2"
