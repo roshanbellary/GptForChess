@@ -38,17 +38,22 @@ from train import (
 RESULT_TO_LABEL = {"1-0": 1.0, "0-1": -1.0, "1/2-1/2": 0.0}
 
 
-def _save_as_memmap(samples: list[tuple[list[int], float]], out_dir: Path, name: str) -> None:
+def _save_as_memmap(
+    samples: list[tuple[list[int], float]], out_dir: Path, name: str, max_seq_len: int = 128
+) -> None:
     """Save samples as memory-mapped arrays for fast DataLoader access.
 
+    Sequences longer than max_seq_len are truncated (keeps the most recent tokens,
+    since the CLS token is at position 0 we keep ids[:max_seq_len]).
+
     Produces three files:
-      {name}_tokens.bin   — (N, max_len) int16, zero-padded
+      {name}_tokens.bin   — (N, max_seq_len) int16, zero-padded
       {name}_labels.bin   — (N,) float32
-      {name}_lengths.bin  — (N,) int16, actual sequence length per sample
+      {name}_lengths.bin  — (N,) int16, actual sequence length per sample (capped at max_seq_len)
       {name}_meta.pt      — dict with 'n' and 'max_len'
     """
     n = len(samples)
-    max_len = max(len(ids) for ids, _ in samples)
+    max_len = min(max(len(ids) for ids, _ in samples), max_seq_len)
     print(f"  memmap {name}: {n:,} samples, max_seq_len={max_len}")
 
     tokens = np.memmap(out_dir / f"{name}_tokens.bin", dtype=np.int16, mode="w+", shape=(n, max_len))
@@ -56,6 +61,7 @@ def _save_as_memmap(samples: list[tuple[list[int], float]], out_dir: Path, name:
     lengths = np.memmap(out_dir / f"{name}_lengths.bin", dtype=np.int16, mode="w+", shape=(n,))
 
     for i, (ids, label) in enumerate(samples):
+        ids = ids[:max_len]
         l = len(ids)
         tokens[i, :l] = ids
         labels[i] = label
@@ -205,7 +211,7 @@ def stage2_outcome_samples(args: argparse.Namespace) -> None:
         skip_ply=args.skip_ply,
     )
     print(f"Stage 2: saving {len(samples):,} outcome samples as memmap...")
-    _save_as_memmap(samples, args.out_dir, "outcome")
+    _save_as_memmap(samples, args.out_dir, "outcome", max_seq_len=args.max_seq_len)
 
 
 def stage3_stockfish_samples(args: argparse.Namespace) -> None:
@@ -234,7 +240,7 @@ def stage3_stockfish_samples(args: argparse.Namespace) -> None:
     )
 
     print(f"Stage 3: saving {len(samples):,} stockfish samples as memmap...")
-    _save_as_memmap(samples, args.out_dir, "stockfish")
+    _save_as_memmap(samples, args.out_dir, "stockfish", max_seq_len=args.max_seq_len)
 
 
 def main():
@@ -251,6 +257,8 @@ def main():
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--stockfish-depth", type=int, default=12)
     parser.add_argument("--max-language-size", type=int, default=2000)
+    parser.add_argument("--max-seq-len", type=int, default=128,
+                        help="Truncate token sequences to this length when writing .bin files")
     parser.add_argument(
         "--force",
         action="store_true",

@@ -57,7 +57,9 @@ class Tokenizer():
                     self.corpus.append(second_elem)
             if (len(combine_tokens) > 0):
                 self.corpus.append(combine_tokens.popleft())
-            
+
+        self.corpus = None
+
     def decode(self, tokens: list[int]) -> str:
         return "".join([self.token_to_symbol[t] for t in tokens])
 

@@ -657,7 +657,7 @@ def _build_argparser():
     p.add_argument("--phase1-epochs", type=int, default=10)
     p.add_argument("--phase2-epochs", type=int, default=10)
     p.add_argument("--batch-size", type=int, default=128)
-    p.add_argument("--learning-rate", type=float, default=1e-4)
+    p.add_argument("--learning-rate", type=float, default=3e-5)
     p.add_argument("--phase2-lr", type=float, default=1e-5)
     p.add_argument("--distill-lambda", type=float, default=0.05)
     p.add_argument("--max-seq-len", type=int, default=512)
