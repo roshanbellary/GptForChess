@@ -23,6 +23,7 @@ import random
 from pathlib import Path
 
 import chess
+import numpy as np
 import torch
 from datasets import load_dataset
 
@@ -35,6 +36,39 @@ from train import (
 
 # Lichess Result → outcome label from white's perspective.
 RESULT_TO_LABEL = {"1-0": 1.0, "0-1": -1.0, "1/2-1/2": 0.0}
+
+
+def _save_as_memmap(samples: list[tuple[list[int], float]], out_dir: Path, name: str) -> None:
+    """Save samples as memory-mapped arrays for fast DataLoader access.
+
+    Produces three files:
+      {name}_tokens.bin   — (N, max_len) int16, zero-padded
+      {name}_labels.bin   — (N,) float32
+      {name}_lengths.bin  — (N,) int16, actual sequence length per sample
+      {name}_meta.pt      — dict with 'n' and 'max_len'
+    """
+    n = len(samples)
+    max_len = max(len(ids) for ids, _ in samples)
+    print(f"  memmap {name}: {n:,} samples, max_seq_len={max_len}")
+
+    tokens = np.memmap(out_dir / f"{name}_tokens.bin", dtype=np.int16, mode="w+", shape=(n, max_len))
+    labels = np.memmap(out_dir / f"{name}_labels.bin", dtype=np.float32, mode="w+", shape=(n,))
+    lengths = np.memmap(out_dir / f"{name}_lengths.bin", dtype=np.int16, mode="w+", shape=(n,))
+
+    for i, (ids, label) in enumerate(samples):
+        l = len(ids)
+        tokens[i, :l] = ids
+        labels[i] = label
+        lengths[i] = l
+        if (i + 1) % 1_000_000 == 0:
+            print(f"  wrote {i + 1:,}/{n:,} samples...")
+
+    tokens.flush()
+    labels.flush()
+    lengths.flush()
+    torch.save({"n": n, "max_len": max_len}, out_dir / f"{name}_meta.pt")
+    size_gb = (tokens.nbytes + labels.nbytes + lengths.nbytes) / 1024 ** 3
+    print(f"  memmap {name} saved ({size_gb:.2f} GB)")
 
 
 def stage1_collect_games(args: argparse.Namespace) -> None:
@@ -136,9 +170,9 @@ def _generate_outcome_samples(games, tokenizer, max_positions_per_game, skip_ply
 
 def stage2_outcome_samples(args: argparse.Namespace) -> None:
     tokenizer_path = args.out_dir / "tokenizer.pt"
-    samples_path = args.out_dir / "outcome_samples.pt"
-    if tokenizer_path.exists() and samples_path.exists() and not args.force:
-        print(f"Stage 2: skipping — {tokenizer_path.name} and {samples_path.name} exist.")
+    meta_path = args.out_dir / "outcome_meta.pt"
+    if tokenizer_path.exists() and meta_path.exists() and not args.force:
+        print(f"Stage 2: skipping — {tokenizer_path.name} and {meta_path.name} exist.")
         return
 
     raw_games_path = args.out_dir / "games_outcome.pt"
@@ -170,14 +204,14 @@ def stage2_outcome_samples(args: argparse.Namespace) -> None:
         max_positions_per_game=args.max_positions_per_game,
         skip_ply=args.skip_ply,
     )
-    print(f"Stage 2: saving {len(samples):,} outcome samples to {samples_path}...")
-    torch.save(samples, samples_path)
+    print(f"Stage 2: saving {len(samples):,} outcome samples as memmap...")
+    _save_as_memmap(samples, args.out_dir, "outcome")
 
 
 def stage3_stockfish_samples(args: argparse.Namespace) -> None:
-    samples_path = args.out_dir / "stockfish_samples.pt"
-    if samples_path.exists() and not args.force:
-        print(f"Stage 3: skipping — {samples_path.name} exists.")
+    meta_path = args.out_dir / "stockfish_meta.pt"
+    if meta_path.exists() and not args.force:
+        print(f"Stage 3: skipping — {meta_path.name} exists.")
         return
 
     games_path = args.out_dir / "games_stockfish.pt"
@@ -199,8 +233,8 @@ def stage3_stockfish_samples(args: argparse.Namespace) -> None:
         skip_ply=args.sf_skip_ply,
     )
 
-    print(f"Stage 3: saving {len(samples):,} stockfish samples to {samples_path}...")
-    torch.save(samples, samples_path)
+    print(f"Stage 3: saving {len(samples):,} stockfish samples as memmap...")
+    _save_as_memmap(samples, args.out_dir, "stockfish")
 
 
 def main():
@@ -235,8 +269,14 @@ def main():
         "games_outcome.pt",
         "games_stockfish.pt",
         "tokenizer.pt",
-        "outcome_samples.pt",
-        "stockfish_samples.pt",
+        "outcome_tokens.bin",
+        "outcome_labels.bin",
+        "outcome_lengths.bin",
+        "outcome_meta.pt",
+        "stockfish_tokens.bin",
+        "stockfish_labels.bin",
+        "stockfish_lengths.bin",
+        "stockfish_meta.pt",
     ):
         path = args.out_dir / name
         size_mb = path.stat().st_size / 1024 / 1024 if path.exists() else 0

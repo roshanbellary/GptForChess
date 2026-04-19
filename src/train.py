@@ -7,6 +7,8 @@ import re
 import random
 import shutil
 import time
+import numpy as np
+from pathlib import Path
 import chess
 import chess.engine
 import torch
@@ -119,7 +121,7 @@ def load_filtered_dataset(min_elo: int = 1500, min_rows: int = 100_000):
     return rows
 
 
-def build_tokenizer_from_games(games: list[dict], max_language_size: int = 2000) -> Tokenizer:
+def build_tokenizer_from_games(games: list[dict], max_language_size: int = 25000) -> Tokenizer:
     """Build a move-level tokenizer from filtered HuggingFace games."""
     all_moves = []
     for game in games:
@@ -148,6 +150,7 @@ class ChessPositionDataset(Dataset):
         self.tokenizer = tokenizer
         self.cls_id = tokenizer.symbol_to_token[CLS_TOKEN]
         self.samples: list[tuple[list[int], float]] = []
+        self._memmap = False
         self._generate_samples(games, eval_fn, max_positions_per_game, skip_ply)
 
     def _generate_samples(self, games, eval_fn, max_positions_per_game, skip_ply):
@@ -188,9 +191,16 @@ class ChessPositionDataset(Dataset):
                 print(f"  processed {idx + 1:,} games, {len(self.samples):,} positions...")
 
     def __len__(self) -> int:
+        if self._memmap:
+            return len(self._mm_labels)
         return len(self.samples)
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, float]:
+    def __getitem__(self, idx: int):
+        if self._memmap:
+            tokens = torch.from_numpy(np.array(self._mm_tokens[idx], dtype=np.int32)).long()
+            length = int(self._mm_lengths[idx])
+            mask = torch.arange(tokens.shape[0]) >= length  # True = padded
+            return tokens, mask, float(self._mm_labels[idx])
         token_ids, score = self.samples[idx]
         return torch.tensor(token_ids, dtype=torch.long), score
 
@@ -201,16 +211,28 @@ class ChessPositionDataset(Dataset):
         inst.tokenizer = tokenizer
         inst.cls_id = tokenizer.symbol_to_token[CLS_TOKEN]
         inst.samples = list(samples)
+        inst._memmap = False
         return inst
 
     @classmethod
     def from_file(cls, samples_path: str, tokenizer: Tokenizer):
-        """Load (token_ids, score) samples from a torch.save file.
-
-        Expected format: a list[tuple[list[int], float]] pickled with torch.save.
-        """
+        """Load (token_ids, score) samples from a torch.save file."""
         samples = torch.load(samples_path, weights_only=False)
         return cls.from_samples(samples, tokenizer)
+
+    @classmethod
+    def from_memmap(cls, out_dir: Path, name: str, tokenizer: Tokenizer):
+        """Load pre-padded samples from memory-mapped arrays (fast DataLoader path)."""
+        meta = torch.load(out_dir / f"{name}_meta.pt", weights_only=True)
+        n, max_len = meta["n"], meta["max_len"]
+        inst = cls.__new__(cls)
+        inst.tokenizer = tokenizer
+        inst.cls_id = tokenizer.symbol_to_token[CLS_TOKEN]
+        inst._memmap = True
+        inst._mm_tokens = np.memmap(out_dir / f"{name}_tokens.bin", dtype=np.int16, mode="r", shape=(n, max_len))
+        inst._mm_labels = np.memmap(out_dir / f"{name}_labels.bin", dtype=np.float32, mode="r", shape=(n,))
+        inst._mm_lengths = np.memmap(out_dir / f"{name}_lengths.bin", dtype=np.int16, mode="r", shape=(n,))
+        return inst
 
 
 # ---------------------------------------------------------------------------
@@ -377,6 +399,12 @@ def collate_fn(batch):
     return padded, attention_mask, labels_tensor
 
 
+def collate_fn_memmap(batch):
+    """Collate pre-padded memmap samples — just stack, no per-batch padding needed."""
+    tokens, masks, labels = zip(*batch)
+    return torch.stack(tokens), torch.stack(masks), torch.tensor(labels, dtype=torch.float)
+
+
 def _fmt_duration(seconds: float) -> str:
     h, m = divmod(int(seconds), 3600)
     m, s = divmod(m, 60)
@@ -497,7 +525,7 @@ def train(
     stockfish_samples_path: str = "data/stockfish_samples.pt",
     phase1_epochs: int = 10,
     phase2_epochs: int = 10,
-    batch_size: int = 128,
+    batch_size: int = 512,
     learning_rate: float = 3e-5,
     phase2_lr: float = 1e-5,
     distill_lambda: float = 0.05,
@@ -520,12 +548,20 @@ def train(
     vocab_size = tokenizer.language_size
 
     # -------------------- Phase 1: outcome pretraining -----------------------
-    print(f"Loading outcome samples from {outcome_samples_path}...")
-    outcome_ds = ChessPositionDataset.from_file(outcome_samples_path, tokenizer)
+    out_dir = Path(outcome_samples_path).parent
+    outcome_meta = out_dir / "outcome_meta.pt"
+    if outcome_meta.exists():
+        print(f"Loading outcome samples from memmap ({out_dir}/outcome_*)...")
+        outcome_ds = ChessPositionDataset.from_memmap(out_dir, "outcome", tokenizer)
+        outcome_collate = collate_fn_memmap
+    else:
+        print(f"Loading outcome samples from {outcome_samples_path}...")
+        outcome_ds = ChessPositionDataset.from_file(outcome_samples_path, tokenizer)
+        outcome_collate = collate_fn
     print(f"Phase 1 dataset size: {len(outcome_ds):,} positions")
 
     outcome_loader = DataLoader(
-        outcome_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_fn,
+        outcome_ds, batch_size=batch_size, shuffle=True, collate_fn=outcome_collate,
         num_workers=8, pin_memory=True,
     )
 
@@ -557,12 +593,19 @@ def train(
     print("Phase 1 checkpoint saved to reward_model_phase1.pt")
 
     # -------------------- Phase 2: Stockfish fine-tuning ---------------------
-    print(f"\nLoading Stockfish samples from {stockfish_samples_path}...")
-    sf_ds = ChessPositionDataset.from_file(stockfish_samples_path, tokenizer)
+    sf_meta = out_dir / "stockfish_meta.pt"
+    if sf_meta.exists():
+        print(f"\nLoading Stockfish samples from memmap ({out_dir}/stockfish_*)...")
+        sf_ds = ChessPositionDataset.from_memmap(out_dir, "stockfish", tokenizer)
+        sf_collate = collate_fn_memmap
+    else:
+        print(f"\nLoading Stockfish samples from {stockfish_samples_path}...")
+        sf_ds = ChessPositionDataset.from_file(stockfish_samples_path, tokenizer)
+        sf_collate = collate_fn
     print(f"Phase 2 dataset size: {len(sf_ds):,} positions")
 
     sf_loader = DataLoader(
-        sf_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_fn,
+        sf_ds, batch_size=batch_size, shuffle=True, collate_fn=sf_collate,
         num_workers=8, pin_memory=True,
     )
 

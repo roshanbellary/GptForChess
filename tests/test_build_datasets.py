@@ -182,35 +182,31 @@ class TestStagesResumable:
         return ns
 
     def test_stage2_produces_valid_outputs(self, tmp_path):
+        import numpy as np
+        from train import ChessPositionDataset
         args = self._make_args(tmp_path)
-        # Seed stage-1 outputs directly (skip HF streaming in tests).
-        # Train tokenizer on all games so both subsets share vocabulary.
         torch.save(SYNTHETIC_GAMES, tmp_path / "games_outcome.pt")
         torch.save(SYNTHETIC_GAMES[:1], tmp_path / "games_stockfish.pt")
 
         stage2_outcome_samples(args)
 
         assert (tmp_path / "tokenizer.pt").exists()
-        assert (tmp_path / "outcome_samples.pt").exists()
-        samples = torch.load(tmp_path / "outcome_samples.pt", weights_only=False)
-        assert len(samples) > 0
-        for token_ids, label in samples:
+        assert (tmp_path / "outcome_meta.pt").exists()
+        tokenizer = torch.load(tmp_path / "tokenizer.pt", weights_only=False)
+        ds = ChessPositionDataset.from_memmap(tmp_path, "outcome", tokenizer)
+        assert len(ds) > 0
+        for tokens, mask, label in ds:
             assert label in {1.0, 0.0, -1.0}
-            assert token_ids[0] == torch.load(tmp_path / "tokenizer.pt",
-                                              weights_only=False
-                                              ).symbol_to_token[CLS_TOKEN]
+            assert tokens[0].item() == tokenizer.symbol_to_token[CLS_TOKEN]
 
     def test_stage3_with_material_fallback_smoke(self, tmp_path, monkeypatch):
         """Stage 3 runs end-to-end using the material-eval fallback (no Stockfish)."""
+        from train import ChessPositionDataset
         args = self._make_args(tmp_path)
-        # Same pattern as stage2 test — train tokenizer on all games so the
-        # stockfish subset's moves are guaranteed to be in vocab.
         torch.save(SYNTHETIC_GAMES, tmp_path / "games_outcome.pt")
         torch.save(SYNTHETIC_GAMES[:1], tmp_path / "games_stockfish.pt")
         stage2_outcome_samples(args)
 
-        # Monkeypatch generate_samples_stockfish_parallel inside build_datasets
-        # to force engine_path=None (material fallback).
         import build_datasets
         orig = build_datasets.generate_samples_stockfish_parallel
 
@@ -221,16 +217,17 @@ class TestStagesResumable:
         monkeypatch.setattr(build_datasets, "generate_samples_stockfish_parallel", no_stockfish)
         stage3_stockfish_samples(args)
 
-        sf_samples = torch.load(tmp_path / "stockfish_samples.pt", weights_only=False)
-        assert len(sf_samples) > 0
-        for _, score in sf_samples:
+        assert (tmp_path / "stockfish_meta.pt").exists()
+        tokenizer = torch.load(tmp_path / "tokenizer.pt", weights_only=False)
+        ds = ChessPositionDataset.from_memmap(tmp_path, "stockfish", tokenizer)
+        assert len(ds) > 0
+        for _, _, score in ds:
             assert -1.0 <= score <= 1.0
 
     def test_stage2_skips_if_outputs_exist(self, tmp_path, capsys):
         args = self._make_args(tmp_path)
         (tmp_path / "tokenizer.pt").write_bytes(b"placeholder")
-        (tmp_path / "outcome_samples.pt").write_bytes(b"placeholder")
-        # Should short-circuit without touching the placeholder files.
+        (tmp_path / "outcome_meta.pt").write_bytes(b"placeholder")
         stage2_outcome_samples(args)
         captured = capsys.readouterr()
         assert "skipping" in captured.out.lower()
@@ -238,7 +235,7 @@ class TestStagesResumable:
 
     def test_stage3_skips_if_output_exists(self, tmp_path, capsys):
         args = self._make_args(tmp_path)
-        (tmp_path / "stockfish_samples.pt").write_bytes(b"placeholder")
+        (tmp_path / "stockfish_meta.pt").write_bytes(b"placeholder")
         stage3_stockfish_samples(args)
         captured = capsys.readouterr()
         assert "skipping" in captured.out.lower()
