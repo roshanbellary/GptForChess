@@ -520,17 +520,19 @@ def _run_epoch_phase2(
 
 
 def train(
-    tokenizer_path: str = "data/tokenizer.pt",
-    outcome_samples_path: str = "data/outcome_samples.pt",
-    stockfish_samples_path: str = "data/stockfish_samples.pt",
-    phase1_epochs: int = 10,
-    phase2_epochs: int = 10,
-    batch_size: int = 512,
-    learning_rate: float = 3e-5,
-    phase2_lr: float = 1e-5,
-    distill_lambda: float = 0.05,
-    max_seq_len: int = 512,
-    log_dir: str = "runs/chess_reward_model",
+    tokenizer_path,
+    outcome_samples_path,
+    stockfish_samples_path,
+    phase1_epochs,
+    phase2_epochs,
+    batch_size,
+    learning_rate,
+    phase2_lr,
+    distill_lambda,
+    max_seq_len,
+    log_dir,
+    phase2_only,
+    phase1_model_path
 ):
     """Two-phase hybrid training.
 
@@ -547,50 +549,60 @@ def train(
     tokenizer = torch.load(tokenizer_path, weights_only=False)
     vocab_size = tokenizer.language_size
 
-    # -------------------- Phase 1: outcome pretraining -----------------------
-    out_dir = Path(outcome_samples_path).parent
-    outcome_meta = out_dir / "outcome_meta.pt"
-    if outcome_meta.exists():
-        print(f"Loading outcome samples from memmap ({out_dir}/outcome_*)...")
-        outcome_ds = ChessPositionDataset.from_memmap(out_dir, "outcome", tokenizer)
-        outcome_collate = collate_fn_memmap
+    model = None
+
+    if not phase2_only:
+        # -------------------- Phase 1: outcome pretraining -----------------------
+        out_dir = Path(outcome_samples_path).parent
+        outcome_meta = out_dir / "outcome_meta.pt"
+        if outcome_meta.exists():
+            print(f"Loading outcome samples from memmap ({out_dir}/outcome_*)...")
+            outcome_ds = ChessPositionDataset.from_memmap(out_dir, "outcome", tokenizer)
+            outcome_collate = collate_fn_memmap
+        else:
+            print(f"Loading outcome samples from {outcome_samples_path}...")
+            outcome_ds = ChessPositionDataset.from_file(outcome_samples_path, tokenizer)
+            outcome_collate = collate_fn
+        print(f"Phase 1 dataset size: {len(outcome_ds):,} positions")
+
+        outcome_loader = DataLoader(
+            outcome_ds, batch_size=batch_size, shuffle=True, collate_fn=outcome_collate,
+            num_workers=8, pin_memory=True,
+        )
+
+        model = ChessRewardModel(vocab_size=vocab_size, max_seq_len=max_seq_len).to(device)
+        optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+        writer = SummaryWriter(log_dir=log_dir)
+        global_step = 0
+
+        print(f"\nPhase 1: {phase1_epochs} epochs, lr={learning_rate}")
+        phase1_start = time.time()
+        for epoch in range(phase1_epochs):
+            epoch_num = epoch + 1
+            print(f"  [phase1] epoch {epoch_num}/{phase1_epochs} starting...")
+            avg_loss, global_step, epoch_secs = _run_epoch_phase1(
+                model, outcome_loader, optimizer, device, writer, global_step, epoch
+            )
+            epochs_left = phase1_epochs - epoch_num
+            eta = epoch_secs * epochs_left
+            print(
+                f"  [phase1] epoch {epoch_num}/{phase1_epochs}  "
+                f"loss={avg_loss:.4f}  "
+                f"epoch_time={_fmt_duration(epoch_secs)}  "
+                f"eta={_fmt_duration(eta)}"
+            )
+
+        phase1_total = time.time() - phase1_start
+        print(f"Phase 1 complete in {_fmt_duration(phase1_total)}")
+        torch.save(model.state_dict(), "reward_model_phase1.pt")
+        print("Phase 1 checkpoint saved to reward_model_phase1.pt")
     else:
-        print(f"Loading outcome samples from {outcome_samples_path}...")
-        outcome_ds = ChessPositionDataset.from_file(outcome_samples_path, tokenizer)
-        outcome_collate = collate_fn
-    print(f"Phase 1 dataset size: {len(outcome_ds):,} positions")
-
-    outcome_loader = DataLoader(
-        outcome_ds, batch_size=batch_size, shuffle=True, collate_fn=outcome_collate,
-        num_workers=8, pin_memory=True,
-    )
-
-    model = ChessRewardModel(vocab_size=vocab_size, max_seq_len=max_seq_len).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
-    writer = SummaryWriter(log_dir=log_dir)
-    global_step = 0
-
-    print(f"\nPhase 1: {phase1_epochs} epochs, lr={learning_rate}")
-    phase1_start = time.time()
-    for epoch in range(phase1_epochs):
-        epoch_num = epoch + 1
-        print(f"  [phase1] epoch {epoch_num}/{phase1_epochs} starting...")
-        avg_loss, global_step, epoch_secs = _run_epoch_phase1(
-            model, outcome_loader, optimizer, device, writer, global_step, epoch
-        )
-        epochs_left = phase1_epochs - epoch_num
-        eta = epoch_secs * epochs_left
-        print(
-            f"  [phase1] epoch {epoch_num}/{phase1_epochs}  "
-            f"loss={avg_loss:.4f}  "
-            f"epoch_time={_fmt_duration(epoch_secs)}  "
-            f"eta={_fmt_duration(eta)}"
-        )
-
-    phase1_total = time.time() - phase1_start
-    print(f"Phase 1 complete in {_fmt_duration(phase1_total)}")
-    torch.save(model.state_dict(), "reward_model_phase1.pt")
-    print("Phase 1 checkpoint saved to reward_model_phase1.pt")
+        model = ChessRewardModel(vocab_size=vocab_size, max_seq_len=max_seq_len).to(device)
+        state_dict = torch.load(phase1_model_path, map_location=device, weights_only=True)
+        model.load_state_dict(state_dict)
+        out_dir = Path(stockfish_samples_path).parent
+        writer = SummaryWriter(log_dir=log_dir)
+        global_step = 0
 
     # -------------------- Phase 2: Stockfish fine-tuning ---------------------
     sf_meta = out_dir / "stockfish_meta.pt"
@@ -656,12 +668,14 @@ def _build_argparser():
     p.add_argument("--stockfish-samples-path", default="data/stockfish_samples.pt")
     p.add_argument("--phase1-epochs", type=int, default=10)
     p.add_argument("--phase2-epochs", type=int, default=10)
-    p.add_argument("--batch-size", type=int, default=128)
+    p.add_argument("--batch-size", type=int, default=1024)
     p.add_argument("--learning-rate", type=float, default=3e-5)
     p.add_argument("--phase2-lr", type=float, default=1e-5)
-    p.add_argument("--distill-lambda", type=float, default=0.05)
+    p.add_argument("--distill-lambda", type=float, default=0.01)
     p.add_argument("--max-seq-len", type=int, default=512)
     p.add_argument("--log-dir", default="runs/chess_reward_model")
+    p.add_argument("--phase2-only", action="store_true", default=False)
+    p.add_argument("--phase1-model-path", default="model/reward_model_phase1.pt")
     return p
 
 
@@ -679,4 +693,6 @@ if __name__ == "__main__":
         distill_lambda=args.distill_lambda,
         max_seq_len=args.max_seq_len,
         log_dir=args.log_dir,
+        phase2_only=args.phase2_only,
+        phase1_model_path=args.phase1_model_path
     )
