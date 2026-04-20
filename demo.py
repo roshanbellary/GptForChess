@@ -227,7 +227,7 @@ def main():
 
     tokenizer = torch.load('data/tokenizer.pt', weights_only=False)
     model = ChessRewardModel(vocab_size=tokenizer.language_size)
-    model.load_state_dict(torch.load('model/reward_model.pt', map_location='cpu', weights_only=False))
+    model.load_state_dict(torch.load('model/reward_model_v2.pt', map_location='cpu', weights_only=False))
     model.eval()
     reward_fn = RewardModelInference(model, tokenizer, device='cpu')
     searcher  = MinimaxSearch(reward_fn=reward_fn, depth=3, top_n=5)

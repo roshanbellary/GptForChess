@@ -672,7 +672,7 @@ def _build_argparser():
     p.add_argument("--learning-rate", type=float, default=3e-5)
     p.add_argument("--phase2-lr", type=float, default=1e-5)
     p.add_argument("--distill-lambda", type=float, default=0.01)
-    p.add_argument("--max-seq-len", type=int, default=512)
+    p.add_argument("--max-seq-len", type=int, default=128)
     p.add_argument("--log-dir", default="runs/chess_reward_model")
     p.add_argument("--phase2-only", action="store_true", default=False)
     p.add_argument("--phase1-model-path", default="model/reward_model_phase1.pt")

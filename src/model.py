@@ -43,7 +43,7 @@ class ChessRewardModel(nn.Module):
         nhead: int = 8,
         num_layers: int = 8,
         dim_feedforward: int = 1024,
-        max_seq_len: int = 512,
+        max_seq_len: int = 128,
         dropout: float = 0.1,
     ):
         super().__init__()
@@ -96,13 +96,16 @@ class RewardModelInference:
         self.model.eval()
 
     @torch.no_grad()
-    def __call__(self, board: chess.Board) -> float:
+    def __call__(self, board: chess.Board, max_seq_len: int = 128) -> float:
         temp_board = chess.Board()
         moves_san = []
         for move in board.move_stack:
             moves_san.append(temp_board.san(move))
             temp_board.push(move)
 
+        # Keep the most recent moves to stay within the training sequence length.
+        # CLS occupies position 0, so cap move history at max_seq_len - 1.
+        moves_san = moves_san[-(max_seq_len - 1):]
         token_ids = [self.cls_id] + self.tokenizer.encode_moves(moves_san)
         token_tensor = torch.tensor([token_ids], dtype=torch.long, device=self.device)
         reward = self.model(token_tensor)
