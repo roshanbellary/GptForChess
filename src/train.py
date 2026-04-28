@@ -589,6 +589,7 @@ def train(
     learning_rate,
     max_seq_len,
     log_dir,
+    num_workers,
 ):
     """Train the reward model from scratch on Stockfish-labeled positions.
 
@@ -615,7 +616,7 @@ def train(
 
     sf_loader = DataLoader(
         sf_ds, batch_size=batch_size, shuffle=True, collate_fn=sf_collate,
-        num_workers=8, pin_memory=True,
+        num_workers=num_workers, pin_memory=True,
     )
 
     model = ChessRewardModel(vocab_size=vocab_size, max_seq_len=max_seq_len).to(device)
@@ -658,6 +659,7 @@ def _build_argparser():
     p.add_argument("--learning-rate", type=float, default=3e-5)
     p.add_argument("--max-seq-len", type=int, default=128)
     p.add_argument("--log-dir", default="runs/chess_reward_model")
+    p.add_argument("--num-workers", type=int, default=8)
     return p
 
 
@@ -671,4 +673,5 @@ if __name__ == "__main__":
         learning_rate=args.learning_rate,
         max_seq_len=args.max_seq_len,
         log_dir=args.log_dir,
+        num_workers=args.num_workers,
     )
