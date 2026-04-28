@@ -26,6 +26,7 @@ import chess
 import numpy as np
 import torch
 from datasets import load_dataset
+from tqdm import tqdm
 
 from model import CLS_TOKEN
 from train import (
@@ -47,27 +48,25 @@ def _save_as_memmap(
     since the CLS token is at position 0 we keep ids[:max_seq_len]).
 
     Produces three files:
-      {name}_tokens.bin   — (N, max_seq_len) int16, zero-padded
+      {name}_tokens.bin   — (N, max_seq_len) int32, zero-padded
       {name}_labels.bin   — (N,) float32
-      {name}_lengths.bin  — (N,) int16, actual sequence length per sample (capped at max_seq_len)
+      {name}_lengths.bin  — (N,) int32, actual sequence length per sample (capped at max_seq_len)
       {name}_meta.pt      — dict with 'n' and 'max_len'
     """
     n = len(samples)
     max_len = min(max(len(ids) for ids, _ in samples), max_seq_len)
     print(f"  memmap {name}: {n:,} samples, max_seq_len={max_len}")
 
-    tokens = np.memmap(out_dir / f"{name}_tokens.bin", dtype=np.int16, mode="w+", shape=(n, max_len))
+    tokens = np.memmap(out_dir / f"{name}_tokens.bin", dtype=np.int32, mode="w+", shape=(n, max_len))
     labels = np.memmap(out_dir / f"{name}_labels.bin", dtype=np.float32, mode="w+", shape=(n,))
-    lengths = np.memmap(out_dir / f"{name}_lengths.bin", dtype=np.int16, mode="w+", shape=(n,))
+    lengths = np.memmap(out_dir / f"{name}_lengths.bin", dtype=np.int32, mode="w+", shape=(n,))
 
-    for i, (ids, label) in enumerate(samples):
+    for i, (ids, label) in enumerate(tqdm(samples, desc=f"  writing {name}", unit="sample")):
         ids = ids[:max_len]
         l = len(ids)
         tokens[i, :l] = ids
         labels[i] = label
         lengths[i] = l
-        if (i + 1) % 1_000_000 == 0:
-            print(f"  wrote {i + 1:,}/{n:,} samples...")
 
     tokens.flush()
     labels.flush()
@@ -106,15 +105,13 @@ def stage1_collect_games(args: argparse.Namespace) -> None:
     stockfish_games: list[dict] = []
     keep_keys = ("movetext", "Result")
 
-    for i, row in enumerate(ds):
+    for i, row in enumerate(tqdm(ds, total=total, desc="Stage 1: streaming", unit="game")):
         minimal = {k: row.get(k) for k in keep_keys}
         if i < args.outcome_games:
             outcome_games.append(minimal)
         else:
             stockfish_games.append(minimal)
 
-        if (i + 1) % 50_000 == 0:
-            print(f"  collected {i + 1:,}/{total:,} games...")
         if i + 1 >= total:
             break
 
@@ -134,42 +131,43 @@ def _generate_outcome_samples(games, tokenizer, max_positions_per_game, skip_ply
     """Build (token_ids, outcome_label) samples for the phase-1 dataset."""
     cls_id = tokenizer.symbol_to_token[CLS_TOKEN]
     samples: list[tuple[list[int], float]] = []
-    for idx, game in enumerate(games):
-        result = game.get("Result")
-        if result not in RESULT_TO_LABEL:
-            continue
-        label = RESULT_TO_LABEL[result]
+    with tqdm(games, desc="Stage 2: outcome samples", unit="game") as pbar:
+        for idx, game in enumerate(pbar):
+            result = game.get("Result")
+            if result not in RESULT_TO_LABEL:
+                continue
+            label = RESULT_TO_LABEL[result]
 
-        movetext = game.get("movetext", "")
-        if not movetext:
-            continue
-        move_sans = parse_movetext(movetext)
-        if len(move_sans) < max(2, skip_ply + 1):
-            continue
+            movetext = game.get("movetext", "")
+            if not movetext:
+                continue
+            move_sans = parse_movetext(movetext)
+            if len(move_sans) < max(2, skip_ply + 1):
+                continue
 
-        eligible = list(range(skip_ply, len(move_sans)))
-        num_positions = min(max_positions_per_game, len(eligible))
-        rng = random.Random(idx)
-        sample_indices = set(rng.sample(eligible, num_positions))
+            eligible = list(range(skip_ply, len(move_sans)))
+            num_positions = min(max_positions_per_game, len(eligible))
+            rng = random.Random(idx)
+            sample_indices = set(rng.sample(eligible, num_positions))
 
-        board = chess.Board()
-        valid_moves: list[str] = []
-        for i, san in enumerate(move_sans):
-            try:
-                move = board.parse_san(san)
-                board.push(move)
-                valid_moves.append(san)
-            except (chess.InvalidMoveError, chess.AmbiguousMoveError):
-                break
-            if i in sample_indices:
+            board = chess.Board()
+            valid_moves: list[str] = []
+            for i, san in enumerate(move_sans):
                 try:
-                    token_ids = [cls_id] + tokenizer.encode_moves(valid_moves)
-                except KeyError:
-                    continue
-                samples.append((token_ids, label))
+                    move = board.parse_san(san)
+                    board.push(move)
+                    valid_moves.append(san)
+                except (chess.InvalidMoveError, chess.AmbiguousMoveError):
+                    break
+                if i in sample_indices:
+                    try:
+                        token_ids = [cls_id] + tokenizer.encode_moves(valid_moves)
+                    except KeyError:
+                        continue
+                    samples.append((token_ids, label))
 
-        if (idx + 1) % 50_000 == 0:
-            print(f"  processed {idx + 1:,}/{len(games):,} games, {len(samples):,} samples")
+            if (idx + 1) % 50_000 == 0:
+                pbar.set_postfix(samples=f"{len(samples):,}")
 
     return samples
 
@@ -247,8 +245,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out-dir", type=Path, default=Path("data"))
     parser.add_argument("--outcome-games", type=int, default=1_000_000)
-    parser.add_argument("--stockfish-games", type=int, default=30_000)
-    parser.add_argument("--min-elo", type=int, default=1500)
+    parser.add_argument("--stockfish-games", type=int, default=500_000)
+    parser.add_argument("--min-elo", type=int, default=1800)
     parser.add_argument("--max-positions-per-game", type=int, default=20)
     parser.add_argument("--skip-ply", type=int, default=10,
                         help="Plies to drop from outcome dataset (noisy opening labels)")
@@ -256,7 +254,7 @@ def main():
                         help="Plies to drop from Stockfish dataset (0 = include openings)")
     parser.add_argument("--workers", type=int, default=8)
     parser.add_argument("--stockfish-depth", type=int, default=12)
-    parser.add_argument("--max-language-size", type=int, default=2000)
+    parser.add_argument("--max-language-size", type=int, default=30000)
     parser.add_argument("--max-seq-len", type=int, default=128,
                         help="Truncate token sequences to this length when writing .bin files")
     parser.add_argument(

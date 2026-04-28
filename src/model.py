@@ -39,10 +39,10 @@ class ChessRewardModel(nn.Module):
     def __init__(
         self,
         vocab_size: int,
-        d_model: int = 256,
+        d_model: int = 512,
         nhead: int = 8,
         num_layers: int = 8,
-        dim_feedforward: int = 1024,
+        dim_feedforward: int = 2048,
         max_seq_len: int = 128,
         dropout: float = 0.1,
     ):

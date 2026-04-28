@@ -121,9 +121,136 @@ def load_filtered_dataset(min_elo: int = 1500, min_rows: int = 100_000):
     return rows
 
 
-def build_tokenizer_from_games(games: list[dict], max_language_size: int = 25000) -> Tokenizer:
+def _enumerate_all_san_moves() -> list[str]:
+    """Generate every SAN move string that can legally appear in a chess game.
+
+    Constructs synthetic positions to cover: all piece moves, captures,
+    file/rank/square disambiguation, pawn promotions, and check/checkmate
+    suffixes (python-chess appends + and # automatically).
+    """
+    seen: set[str] = set()
+
+    def collect(board: chess.Board) -> None:
+        for move in board.legal_moves:
+            try:
+                seen.add(board.san(move))
+            except Exception:
+                pass
+
+    def place_kings(board: chess.Board, occupied: set[int]) -> bool:
+        """Place both kings on non-adjacent empty squares far from the action."""
+        w_sq = b_sq = None
+        for sq in reversed(chess.SQUARES):  # start from h8 to avoid blocking rank 1
+            if sq in occupied:
+                continue
+            if w_sq is None:
+                w_sq = sq
+                continue
+            if chess.square_distance(sq, w_sq) > 1:
+                b_sq = sq
+                break
+        if w_sq is None or b_sq is None:
+            return False
+        board.set_piece_at(w_sq, chess.Piece(chess.KING, chess.WHITE))
+        board.set_piece_at(b_sq, chess.Piece(chess.KING, chess.BLACK))
+        return True
+
+    for color in (chess.WHITE, chess.BLACK):
+        opp = not color
+
+        for piece_type in (chess.PAWN, chess.KNIGHT, chess.BISHOP,
+                           chess.ROOK, chess.QUEEN, chess.KING):
+            for from_sq in chess.SQUARES:
+                rank = chess.square_rank(from_sq)
+                # Pawns can't sit on their own back rank or promotion rank
+                if piece_type == chess.PAWN:
+                    if color == chess.WHITE and rank in (0, 7):
+                        continue
+                    if color == chess.BLACK and rank in (0, 7):
+                        continue
+
+                # ── basic move (no captures) ──────────────────────────────
+                b = chess.Board(None)
+                b.turn = color
+                b.set_piece_at(from_sq, chess.Piece(piece_type, color))
+                occupied = {from_sq}
+                if piece_type != chess.KING:
+                    if not place_kings(b, occupied):
+                        continue
+                else:
+                    # Only need the opposing king
+                    for ksq in chess.SQUARES:
+                        if ksq not in occupied and chess.square_distance(ksq, from_sq) > 1:
+                            b.set_piece_at(ksq, chess.Piece(chess.KING, opp))
+                            break
+                collect(b)
+
+                # ── captures: enemy pawn on each reachable square ─────────
+                if piece_type != chess.KING:
+                    for cap_sq in chess.SQUARES:
+                        if b.piece_at(cap_sq):
+                            continue
+                        b2 = b.copy()
+                        b2.set_piece_at(cap_sq, chess.Piece(chess.PAWN, opp))
+                        collect(b2)
+
+                # ── disambiguation: add a second friendly piece ───────────
+                if piece_type not in (chess.PAWN, chess.KING):
+                    for sq2 in chess.SQUARES:
+                        if b.piece_at(sq2):
+                            continue
+                        b3 = b.copy()
+                        b3.set_piece_at(sq2, chess.Piece(piece_type, color))
+                        collect(b3)
+                        # ── disambiguation + capture ──────────────────────
+                        for cap_sq in chess.SQUARES:
+                            if b3.piece_at(cap_sq):
+                                continue
+                            b4 = b3.copy()
+                            b4.set_piece_at(cap_sq, chess.Piece(chess.PAWN, opp))
+                            collect(b4)
+
+    # Promotions: kings placed on rank 3 (away from promotion ranks 1 and 8)
+    # so promotion squares aren't automatically checks.
+    for color in (chess.WHITE, chess.BLACK):
+        opp = not color
+        promo_rank = 6 if color == chess.WHITE else 1  # 7th rank, 0-indexed
+        dest_rank  = 7 if color == chess.WHITE else 0
+        for file in range(8):
+            from_sq = chess.square(file, promo_rank)
+            b = chess.Board(None)
+            b.turn = color
+            b.set_piece_at(from_sq, chess.Piece(chess.PAWN, color))
+            # Kings mid-board on rank 3, away from promotion diagonals
+            b.set_piece_at(chess.square(0, 3), chess.Piece(chess.KING, chess.WHITE))
+            b.set_piece_at(chess.square(2, 3), chess.Piece(chess.KING, chess.BLACK))
+            collect(b)
+            # Capture-promotions: enemy piece on adjacent diagonal squares
+            for df in (-1, 1):
+                cap_file = file + df
+                if 0 <= cap_file < 8:
+                    cap_sq = chess.square(cap_file, dest_rank)
+                    b2 = b.copy()
+                    if not b2.piece_at(cap_sq):
+                        b2.set_piece_at(cap_sq, chess.Piece(chess.ROOK, opp))
+                        collect(b2)
+
+    # Castling suffixes not produced by the above (no room for rooks + kings
+    # in the tight board setups), so add them explicitly.
+    for suffix in ('', '+', '#'):
+        seen.add('O-O' + suffix)
+        seen.add('O-O-O' + suffix)
+
+    return list(seen)
+
+
+def build_tokenizer_from_games(games: list[dict], max_language_size) -> Tokenizer:
     """Build a move-level tokenizer from filtered HuggingFace games."""
-    all_moves = []
+    # Seed corpus with every possible SAN move so no inference position
+    # can produce an unknown token.
+    all_moves: list[str] = _enumerate_all_san_moves()
+    print(f"  seeded tokenizer with {len(set(all_moves)):,} synthetic SAN moves")
+
     for game in games:
         movetext = game.get("movetext", "")
         if not movetext:
@@ -229,9 +356,9 @@ class ChessPositionDataset(Dataset):
         inst.tokenizer = tokenizer
         inst.cls_id = tokenizer.symbol_to_token[CLS_TOKEN]
         inst._memmap = True
-        inst._mm_tokens = np.memmap(out_dir / f"{name}_tokens.bin", dtype=np.int16, mode="r", shape=(n, max_len))
+        inst._mm_tokens = np.memmap(out_dir / f"{name}_tokens.bin", dtype=np.int32, mode="r", shape=(n, max_len))
         inst._mm_labels = np.memmap(out_dir / f"{name}_labels.bin", dtype=np.float32, mode="r", shape=(n,))
-        inst._mm_lengths = np.memmap(out_dir / f"{name}_lengths.bin", dtype=np.int16, mode="r", shape=(n,))
+        inst._mm_lengths = np.memmap(out_dir / f"{name}_lengths.bin", dtype=np.int32, mode="r", shape=(n,))
         return inst
 
 
