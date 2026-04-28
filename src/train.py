@@ -1,6 +1,5 @@
 import argparse
 import atexit
-import copy
 import math
 import multiprocessing as mp
 import re
@@ -538,8 +537,8 @@ def _fmt_duration(seconds: float) -> str:
     return f"{h}h {m:02d}m {s:02d}s" if h else f"{m}m {s:02d}s"
 
 
-def _run_epoch_phase1(model, loader, optimizer, device, writer, global_step, epoch_idx):
-    """Single epoch of phase-1 outcome MSE training."""
+def _run_epoch(model, loader, optimizer, device, writer, global_step, epoch_idx):
+    """Single training epoch: MSE against Stockfish labels."""
     model.train()
     total_loss = 0.0
     n_batches = len(loader)
@@ -560,7 +559,7 @@ def _run_epoch_phase1(model, loader, optimizer, device, writer, global_step, epo
         optimizer.step()
         total_loss += loss.item()
 
-        writer.add_scalar("phase1/batch_loss", loss.item(), global_step)
+        writer.add_scalar("train/batch_loss", loss.item(), global_step)
         global_step += 1
 
         if (i + 1) % log_every == 0 or (i + 1) == n_batches:
@@ -578,96 +577,22 @@ def _run_epoch_phase1(model, loader, optimizer, device, writer, global_step, epo
 
     epoch_elapsed = time.time() - epoch_start
     avg = total_loss / n_batches
-    writer.add_scalar("phase1/epoch_loss", avg, epoch_idx)
+    writer.add_scalar("train/epoch_loss", avg, epoch_idx)
     return avg, global_step, epoch_elapsed
-
-
-def _run_epoch_phase2(
-    model, teacher, loader, optimizer, device, writer, global_step, epoch_idx, distill_lambda
-):
-    """Single epoch of phase-2 Stockfish training with distillation regularizer.
-
-    loss = MSE(pred, stockfish_label) + λ * MSE(pred, teacher(x).detach())
-    """
-    model.train()
-    total_task = total_distill = total_combined = 0.0
-    n_batches = len(loader)
-    log_every = max(1, n_batches // 20)
-    epoch_start = time.time()
-
-    for i, (batch_tokens, batch_mask, batch_labels) in enumerate(loader):
-        batch_tokens = batch_tokens.to(device)
-        batch_mask = batch_mask.to(device)
-        batch_labels = batch_labels.to(device)
-
-        predictions = model(batch_tokens, attention_mask=batch_mask)
-        with torch.no_grad():
-            teacher_preds = teacher(batch_tokens, attention_mask=batch_mask)
-
-        task_loss = F.mse_loss(predictions, batch_labels)
-        distill_loss = F.mse_loss(predictions, teacher_preds)
-        loss = task_loss + distill_lambda * distill_loss
-
-        optimizer.zero_grad()
-        loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
-
-        total_task += task_loss.item()
-        total_distill += distill_loss.item()
-        total_combined += loss.item()
-
-        writer.add_scalar("phase2/batch_task_mse", task_loss.item(), global_step)
-        writer.add_scalar("phase2/batch_distill", distill_loss.item(), global_step)
-        writer.add_scalar("phase2/batch_total", loss.item(), global_step)
-        global_step += 1
-
-        if (i + 1) % log_every == 0 or (i + 1) == n_batches:
-            elapsed = time.time() - epoch_start
-            batches_done = i + 1
-            eta = elapsed / batches_done * (n_batches - batches_done)
-            samples_per_sec = batches_done * batch_tokens.size(0) / elapsed
-            print(
-                f"    batch {batches_done:,}/{n_batches:,}  "
-                f"task={total_task/batches_done:.4f}  "
-                f"distill={total_distill/batches_done:.4f}  "
-                f"{samples_per_sec:,.0f} samples/s  "
-                f"eta {_fmt_duration(eta)}"
-            )
-
-    epoch_elapsed = time.time() - epoch_start
-    n = n_batches
-    avg_task = total_task / n
-    avg_distill = total_distill / n
-    avg_total = total_combined / n
-    writer.add_scalar("phase2/epoch_task_mse", avg_task, epoch_idx)
-    writer.add_scalar("phase2/epoch_distill", avg_distill, epoch_idx)
-    writer.add_scalar("phase2/epoch_total", avg_total, epoch_idx)
-    return avg_task, avg_distill, avg_total, global_step, epoch_elapsed
 
 
 def train(
     tokenizer_path,
-    outcome_samples_path,
     stockfish_samples_path,
-    phase1_epochs,
-    phase2_epochs,
+    epochs,
     batch_size,
     learning_rate,
-    phase2_lr,
-    distill_lambda,
     max_seq_len,
     log_dir,
-    phase2_only,
-    phase1_model_path
 ):
-    """Two-phase hybrid training.
+    """Train the reward model from scratch on Stockfish-labeled positions.
 
-    Phase 1: MSE against game-outcome labels ({+1, 0, -1}) on a large dataset.
-    Phase 2: MSE against Stockfish labels + λ·MSE-to-frozen-phase-1-teacher
-             on a smaller disjoint dataset.
-
-    Both datasets must be built first by src/build_datasets.py.
+    Requires stockfish memmap files built by src/build_datasets.py.
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Using device: {device}")
@@ -676,133 +601,63 @@ def train(
     tokenizer = torch.load(tokenizer_path, weights_only=False)
     vocab_size = tokenizer.language_size
 
-    model = None
-
-    if not phase2_only:
-        # -------------------- Phase 1: outcome pretraining -----------------------
-        out_dir = Path(outcome_samples_path).parent
-        outcome_meta = out_dir / "outcome_meta.pt"
-        if outcome_meta.exists():
-            print(f"Loading outcome samples from memmap ({out_dir}/outcome_*)...")
-            outcome_ds = ChessPositionDataset.from_memmap(out_dir, "outcome", tokenizer)
-            outcome_collate = collate_fn_memmap
-        else:
-            print(f"Loading outcome samples from {outcome_samples_path}...")
-            outcome_ds = ChessPositionDataset.from_file(outcome_samples_path, tokenizer)
-            outcome_collate = collate_fn
-        print(f"Phase 1 dataset size: {len(outcome_ds):,} positions")
-
-        outcome_loader = DataLoader(
-            outcome_ds, batch_size=batch_size, shuffle=True, collate_fn=outcome_collate,
-            num_workers=8, pin_memory=True,
-        )
-
-        model = ChessRewardModel(vocab_size=vocab_size, max_seq_len=max_seq_len).to(device)
-        optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
-        writer = SummaryWriter(log_dir=log_dir)
-        global_step = 0
-
-        print(f"\nPhase 1: {phase1_epochs} epochs, lr={learning_rate}")
-        phase1_start = time.time()
-        for epoch in range(phase1_epochs):
-            epoch_num = epoch + 1
-            print(f"  [phase1] epoch {epoch_num}/{phase1_epochs} starting...")
-            avg_loss, global_step, epoch_secs = _run_epoch_phase1(
-                model, outcome_loader, optimizer, device, writer, global_step, epoch
-            )
-            epochs_left = phase1_epochs - epoch_num
-            eta = epoch_secs * epochs_left
-            print(
-                f"  [phase1] epoch {epoch_num}/{phase1_epochs}  "
-                f"loss={avg_loss:.4f}  "
-                f"epoch_time={_fmt_duration(epoch_secs)}  "
-                f"eta={_fmt_duration(eta)}"
-            )
-
-        phase1_total = time.time() - phase1_start
-        print(f"Phase 1 complete in {_fmt_duration(phase1_total)}")
-        torch.save(model.state_dict(), "reward_model_phase1.pt")
-        print("Phase 1 checkpoint saved to reward_model_phase1.pt")
-    else:
-        model = ChessRewardModel(vocab_size=vocab_size, max_seq_len=max_seq_len).to(device)
-        state_dict = torch.load(phase1_model_path, map_location=device, weights_only=True)
-        model.load_state_dict(state_dict)
-        out_dir = Path(stockfish_samples_path).parent
-        writer = SummaryWriter(log_dir=log_dir)
-        global_step = 0
-
-    # -------------------- Phase 2: Stockfish fine-tuning ---------------------
+    out_dir = Path(stockfish_samples_path).parent
     sf_meta = out_dir / "stockfish_meta.pt"
     if sf_meta.exists():
-        print(f"\nLoading Stockfish samples from memmap ({out_dir}/stockfish_*)...")
+        print(f"Loading Stockfish samples from memmap ({out_dir}/stockfish_*)...")
         sf_ds = ChessPositionDataset.from_memmap(out_dir, "stockfish", tokenizer)
         sf_collate = collate_fn_memmap
     else:
-        print(f"\nLoading Stockfish samples from {stockfish_samples_path}...")
+        print(f"Loading Stockfish samples from {stockfish_samples_path}...")
         sf_ds = ChessPositionDataset.from_file(stockfish_samples_path, tokenizer)
         sf_collate = collate_fn
-    print(f"Phase 2 dataset size: {len(sf_ds):,} positions")
+    print(f"Dataset size: {len(sf_ds):,} positions")
 
     sf_loader = DataLoader(
         sf_ds, batch_size=batch_size, shuffle=True, collate_fn=sf_collate,
         num_workers=8, pin_memory=True,
     )
 
-    # Frozen teacher — a deep copy of the phase-1 model held in eval mode.
-    # Gradients disabled so teacher forward passes are cheap and don't leak grads.
-    teacher = copy.deepcopy(model).to(device)
-    teacher.eval()
-    for p in teacher.parameters():
-        p.requires_grad = False
+    model = ChessRewardModel(vocab_size=vocab_size, max_seq_len=max_seq_len).to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
+    writer = SummaryWriter(log_dir=log_dir)
+    global_step = 0
 
-    # Fresh optimizer for phase 2 with a lower LR so Stockfish fine-tuning
-    # doesn't clobber phase-1 representations.
-    phase2_optimizer = torch.optim.AdamW(model.parameters(), lr=phase2_lr)
-
-    print(
-        f"\nPhase 2: {phase2_epochs} epochs, lr={phase2_lr}, "
-        f"distill_lambda={distill_lambda}"
-    )
-    phase2_start = time.time()
-    for epoch in range(phase2_epochs):
+    print(f"\nTraining: {epochs} epochs, lr={learning_rate}")
+    train_start = time.time()
+    for epoch in range(epochs):
         epoch_num = epoch + 1
-        print(f"  [phase2] epoch {epoch_num}/{phase2_epochs} starting...")
-        avg_task, avg_distill, avg_total, global_step, epoch_secs = _run_epoch_phase2(
-            model, teacher, sf_loader, phase2_optimizer, device,
-            writer, global_step, epoch, distill_lambda,
+        print(f"  [epoch {epoch_num}/{epochs}] starting...")
+        avg_loss, global_step, epoch_secs = _run_epoch(
+            model, sf_loader, optimizer, device, writer, global_step, epoch
         )
-        epochs_left = phase2_epochs - epoch_num
+        epochs_left = epochs - epoch_num
         eta = epoch_secs * epochs_left
         print(
-            f"  [phase2] epoch {epoch_num}/{phase2_epochs}  "
-            f"task_mse={avg_task:.4f}  distill={avg_distill:.4f}  total={avg_total:.4f}  "
-            f"epoch_time={_fmt_duration(epoch_secs)}  eta={_fmt_duration(eta)}"
+            f"  [epoch {epoch_num}/{epochs}]  "
+            f"loss={avg_loss:.4f}  "
+            f"epoch_time={_fmt_duration(epoch_secs)}  "
+            f"eta={_fmt_duration(eta)}"
         )
 
-    phase2_total = time.time() - phase2_start
-    print(f"Phase 2 complete in {_fmt_duration(phase2_total)}")
+    total_elapsed = time.time() - train_start
+    print(f"Training complete in {_fmt_duration(total_elapsed)}")
     writer.close()
 
     torch.save(model.state_dict(), "reward_model.pt")
-    print("\nFinal model saved to reward_model.pt")
+    print("\nModel saved to reward_model.pt")
     return model, tokenizer
 
 
 def _build_argparser():
     p = argparse.ArgumentParser(description=train.__doc__)
     p.add_argument("--tokenizer-path", default="data/tokenizer.pt")
-    p.add_argument("--outcome-samples-path", default="data/outcome_samples.pt")
     p.add_argument("--stockfish-samples-path", default="data/stockfish_samples.pt")
-    p.add_argument("--phase1-epochs", type=int, default=10)
-    p.add_argument("--phase2-epochs", type=int, default=10)
+    p.add_argument("--epochs", type=int, default=15)
     p.add_argument("--batch-size", type=int, default=1024)
     p.add_argument("--learning-rate", type=float, default=3e-5)
-    p.add_argument("--phase2-lr", type=float, default=1e-5)
-    p.add_argument("--distill-lambda", type=float, default=0.01)
     p.add_argument("--max-seq-len", type=int, default=128)
     p.add_argument("--log-dir", default="runs/chess_reward_model")
-    p.add_argument("--phase2-only", action="store_true", default=False)
-    p.add_argument("--phase1-model-path", default="model/reward_model_phase1.pt")
     return p
 
 
@@ -810,16 +665,10 @@ if __name__ == "__main__":
     args = _build_argparser().parse_args()
     train(
         tokenizer_path=args.tokenizer_path,
-        outcome_samples_path=args.outcome_samples_path,
         stockfish_samples_path=args.stockfish_samples_path,
-        phase1_epochs=args.phase1_epochs,
-        phase2_epochs=args.phase2_epochs,
+        epochs=args.epochs,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
-        phase2_lr=args.phase2_lr,
-        distill_lambda=args.distill_lambda,
         max_seq_len=args.max_seq_len,
         log_dir=args.log_dir,
-        phase2_only=args.phase2_only,
-        phase1_model_path=args.phase1_model_path
     )

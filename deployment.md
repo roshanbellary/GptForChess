@@ -1,14 +1,14 @@
 # Deployment
 
-End-to-end workflow: build datasets locally → train on a rented Vast.ai GPU → pull the trained model back for local inference via MCTS.
+End-to-end workflow: build Stockfish dataset locally → train on a rented Vast.ai GPU → pull the trained model back for local inference via MCTS.
 
 ```
  LOCAL (Mac)                            VAST (rented GPU)
  ───────────                            ─────────────────
- 1. build_datasets.py    scp data/ →    4. poetry install
- 2. verify artifacts                    5. train.py (two-phase)
-                         ← scp model    6. shutdown
- 7. load + run inference
+ 1. build_datasets.py    scp data/ →    3. install deps
+ 2. verify artifacts                    4. train.py
+                         ← scp model    5. shutdown
+ 6. load + run inference
 ```
 
 ---
@@ -26,83 +26,66 @@ End-to-end workflow: build datasets locally → train on a rented Vast.ai GPU �
 
 ---
 
-## Step 1 — Build the datasets locally (~60–90 min)
+## Step 1 — Build the Stockfish dataset locally
 
-Run the full resumable builder with defaults (1M outcome + 30K Stockfish games, depth 12, 8 workers):
+Run the full resumable builder. Stockfish labeling is the slow step — scale `--workers` to your core count and budget time accordingly (~15 hrs on 8 cores, ~5 hrs on 32 cores):
 
 ```bash
-poetry run python src/build_datasets.py
+arch -arm64 poetry run python src/build_datasets.py \
+  --stockfish-games 500000 \
+  --workers 10 \
+  --stockfish-depth 12
 ```
 
-Key defaults:
-- `--skip-ply=10` — outcome dataset drops first 10 plies (opening positions carry noisy labels when labeled by game result)
-- `--sf-skip-ply=0` — Stockfish dataset includes all positions including openings (Stockfish labels are precise per-position, so the model learns accurate opening evaluations during phase-2 fine-tuning)
+Key flags:
+- `--stockfish-games` — number of games to label with Stockfish. 500K × 20 positions = ~10M training samples.
+- `--workers` — one Stockfish subprocess per core. Set to (physical core count − 2).
+- `--stockfish-depth` — depth 12 is a good quality/speed tradeoff. Depth 10 is ~4x faster with only a small quality drop.
 
-Each dataset is saved as memory-mapped binary arrays (`.bin`) for fast DataLoader access. Expected artifacts in `data/`:
+Each stage is resumable — re-running skips completed stages. Use `--force` to re-run everything.
+
+Expected artifacts in `data/` after completion:
 
 | File | Description | Approx size |
 |---|---|---|
-| `games_outcome.pt` | Raw outcome-subset games | ~100 MB |
-| `games_stockfish.pt` | Raw Stockfish-subset games | ~3 MB |
 | `tokenizer.pt` | Shared BPE tokenizer | <1 MB |
-| `outcome_tokens.bin` | (N, max_len) int16 token ids, zero-padded | ~6–10 GB |
-| `outcome_labels.bin` | (N,) float32 outcome labels {−1, 0, +1} | ~76 MB |
-| `outcome_lengths.bin` | (N,) int16 actual sequence lengths | ~38 MB |
-| `outcome_meta.pt` | Dict: `n` (sample count), `max_len` | <1 MB |
-| `stockfish_tokens.bin` | (N, max_len) int16 token ids, zero-padded | ~200–300 MB |
-| `stockfish_labels.bin` | (N,) float32 Stockfish labels in [−1, 1] | ~2 MB |
-| `stockfish_lengths.bin` | (N,) int16 actual sequence lengths | ~1 MB |
+| `stockfish_tokens.bin` | (N, max_len) int32 token ids, zero-padded | ~5 GB |
+| `stockfish_labels.bin` | (N,) float32 Stockfish labels in [−1, 1] | ~40 MB |
+| `stockfish_lengths.bin` | (N,) int32 actual sequence lengths | ~20 MB |
 | `stockfish_meta.pt` | Dict: `n` (sample count), `max_len` | <1 MB |
 
-Only the `tokenizer.pt`, `outcome_*`, and `stockfish_*` files are needed for training. The `games_*.pt` files are intermediate artifacts.
-
-**Resuming after a crash:** just re-run the same command — each stage skips if its output exists. Use `--force` to re-run everything.
-
-**Smaller smoke run (2 min):**
-```bash
-poetry run python src/build_datasets.py \
-  --outcome-games=500 --stockfish-games=50 \
-  --stockfish-depth=6 --workers=4 --out-dir=data_smoke
-```
+`games_outcome.pt`, `games_stockfish.pt` are intermediate artifacts — not needed for training.
 
 ## Step 2 — Verify artifacts before renting
 
-Catching a bad dataset *before* you pay for a GPU is worth 30 seconds:
-
 ```bash
-PYTHONPATH=src poetry run python -c "
+PYTHONPATH=src arch -arm64 poetry run python -c "
 import torch
 import numpy as np
 
 tok = torch.load('data/tokenizer.pt', weights_only=False)
-out_meta = torch.load('data/outcome_meta.pt', weights_only=True)
-sf_meta  = torch.load('data/stockfish_meta.pt', weights_only=True)
-
-out_labels = np.memmap('data/outcome_labels.bin', dtype=np.float32, mode='r',
-                        shape=(out_meta['n'],))
-sf_labels  = np.memmap('data/stockfish_labels.bin', dtype=np.float32, mode='r',
-                        shape=(sf_meta['n'],))
+sf_meta = torch.load('data/stockfish_meta.pt', weights_only=True)
+sf_labels = np.memmap('data/stockfish_labels.bin', dtype=np.float32, mode='r',
+                       shape=(sf_meta['n'],))
 
 print(f'vocab size:        {tok.language_size}')
-print(f'outcome samples:   {out_meta[\"n\"]:,}  max_seq_len={out_meta[\"max_len\"]}  '
-      f'labels: {set(out_labels[:10000].round(1).tolist())}')
-print(f'stockfish samples: {sf_meta[\"n\"]:,}  max_seq_len={sf_meta[\"max_len\"]}  '
-      f'score range: [{sf_labels.min():.3f}, {sf_labels.max():.3f}]')
+print(f'stockfish samples: {sf_meta[\"n\"]:,}  max_seq_len={sf_meta[\"max_len\"]}')
+print(f'score range:       [{sf_labels.min():.3f}, {sf_labels.max():.3f}]')
 "
 ```
 
 Expected roughly:
 ```
-vocab size:        ~2000
-outcome samples:   ~15–20M  max_seq_len=~150–250  labels: {-1.0, 0.0, 1.0}
-stockfish samples: ~400–600K  max_seq_len=~150–250  score range: [-1.0, 1.0]
+vocab size:        ~30000
+stockfish samples: ~8–10M  max_seq_len=128
+score range:       [-1.000, 1.000]
 ```
 
 ## Step 3 — Rent a GPU on Vast.ai
 
 **Search filters:**
-- GPU RAM ≥ 32 GB
-- Disk ≥ 50 GB
+- GPU RAM ≥ 24 GB
+- Disk ≥ 30 GB
 - Reliability ≥ 98%
 - DLPerf ≥ 150 (rules out ancient cards)
 - An ML template preloaded with PyTorch + CUDA
@@ -123,18 +106,17 @@ ssh -p <PORT> root@<HOST>
 apt-get update && apt-get install -y git
 git clone https://github.com/<your-user>/GptForChess.git
 cd GptForChess
-
-# Install Poetry if not present
-curl -sSL https://install.python-poetry.org | python3 -
-export PATH="$HOME/.local/bin:$PATH"
-
-# Install dependencies (Poetry will pick up the CUDA torch from the template)
-poetry install --no-root
 ```
 
-**Note:** Stockfish is *not* required on the remote — you're using pre-labeled datasets. Skip that install.
+Install dependencies without overwriting the template's CUDA-enabled PyTorch:
 
-## Step 5 — Transfer datasets from local to remote (~5–20 min)
+```bash
+pip install python-chess datasets tqdm tensorboard
+```
+
+> **Why not `poetry install`?** Vast templates ship a CUDA PyTorch build. Running `poetry install` can replace it with a CPU-only build from PyPI, breaking GPU training. Installing only the non-torch deps avoids this.
+
+## Step 5 — Transfer datasets from local to remote (~5–15 min)
 
 Back on your **local** machine, from the repo root:
 
@@ -142,10 +124,6 @@ Back on your **local** machine, from the repo root:
 ssh -p <PORT> root@<HOST> "mkdir -p ~/GptForChess/data"
 scp -P <PORT> \
   data/tokenizer.pt \
-  data/outcome_tokens.bin \
-  data/outcome_labels.bin \
-  data/outcome_lengths.bin \
-  data/outcome_meta.pt \
   data/stockfish_tokens.bin \
   data/stockfish_labels.bin \
   data/stockfish_lengths.bin \
@@ -153,22 +131,18 @@ scp -P <PORT> \
   root@<HOST>:~/GptForChess/data/
 ```
 
-Total transfer: ~7–11 GB. At 100 Mbps upload this is ~10–15 min. The bulk is `outcome_tokens.bin` — the padded token array is larger than the old list-of-lists `.pt` because every row is padded to `max_len`.
+Total transfer: ~5 GB. At 100 Mbps upload this is ~7–10 min.
 
-## Step 6 — Train (~1–3 hr on a 32GB card)
+## Step 6 — Train (~1–3 hr on a 24GB card)
 
 On the remote:
 
 ```bash
 cd ~/GptForChess
-poetry run python src/train.py
+PYTHONPATH=src python src/train.py --epochs 15 --batch-size 1024
 ```
 
-The trainer detects `outcome_meta.pt` / `stockfish_meta.pt` and automatically loads both datasets via memory-mapped arrays (`ChessPositionDataset.from_memmap`), which avoids the multi-minute Python deserialization of the old `.pt` format.
-
-Default schedule:
-- Phase 1: 10 epochs on ~20M outcome samples → saves `reward_model_phase1.pt`
-- Phase 2: 10 epochs on ~600K Stockfish samples with distillation regularizer (λ=0.05) → saves `reward_model.pt`
+The trainer detects `stockfish_meta.pt` and loads the dataset via memory-mapped arrays, which avoids multi-minute Python deserialization.
 
 **Watch training live with TensorBoard.** From your **local** machine, set up an SSH tunnel:
 
@@ -177,20 +151,18 @@ ssh -p <PORT> -L 6006:localhost:6006 root@<HOST>
 
 # on remote (in a second shell):
 cd ~/GptForChess
-poetry run tensorboard --logdir runs/chess_reward_model --bind_all
+PYTHONPATH=src python -m tensorboard.main --logdir runs/chess_reward_model --bind_all
 ```
 
-Then open `http://localhost:6006` locally. Expected trajectories:
-- `phase1/epoch_loss` — descends toward ~0.3–0.5 (noisy outcome labels)
-- `phase2/epoch_task_mse` — descends faster (precise Stockfish labels)
-- `phase2/epoch_distill` — small but nonzero (slight drift from phase-1 teacher, as intended)
+Then open `http://localhost:6006` locally. Expected trajectory:
+- `train/epoch_loss` — descends steadily toward ~0.05–0.15
 
 **Common flag overrides:**
 ```bash
-poetry run python src/train.py \
-  --batch-size=256 \
-  --phase1-epochs=15 --phase2-epochs=5 \
-  --distill-lambda=0.1   # stronger anti-drift
+PYTHONPATH=src python src/train.py \
+  --epochs 20 \
+  --batch-size 512 \
+  --learning-rate 1e-4
 ```
 
 ## Step 7 — Pull the model back to local
@@ -200,7 +172,6 @@ From **local** machine:
 ```bash
 scp -P <PORT> \
   root@<HOST>:~/GptForChess/reward_model.pt \
-  root@<HOST>:~/GptForChess/reward_model_phase1.pt \
   .
 
 # optional — pull tensorboard logs so you can browse offline
@@ -216,8 +187,6 @@ Model weights: ~160 MB. Transfer takes seconds.
 
 ## Step 9 — Local inference with MCTS
 
-Load the trained reward model and use it with MCTS. Create a small script:
-
 ```python
 # inference_demo.py
 import chess
@@ -226,7 +195,6 @@ import torch
 from model import ChessRewardModel, RewardModelInference
 from mcts import MinimaxSearch
 
-# Load artifacts
 tokenizer = torch.load("data/tokenizer.pt", weights_only=False)
 model = ChessRewardModel(vocab_size=tokenizer.language_size)
 model.load_state_dict(torch.load("reward_model.pt", map_location="cpu", weights_only=False))
@@ -234,24 +202,14 @@ model.eval()
 
 reward_fn = RewardModelInference(model, tokenizer, device="cpu")
 
-# Sanity check on known positions
 board = chess.Board()
 print(f"starting position: {reward_fn(board):+.3f}")  # should be ≈ 0
-
-board = chess.Board("rnb1kbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1")
-print(f"white up a queen:  {reward_fn(board):+.3f}")  # should be clearly positive
-
-# Run MCTS to find a move
-board = chess.Board()
-searcher = MinimaxSearch(reward_fn=reward_fn, ...)  # use your existing search API
-best_move = searcher.find_best_move(board)
-print(f"best move: {best_move}")
 ```
 
-Run from the repo root with `src/` on the path:
+Run from the repo root:
 
 ```bash
-PYTHONPATH=src poetry run python inference_demo.py
+PYTHONPATH=src arch -arm64 poetry run python inference_demo.py
 ```
 
 ---
@@ -261,19 +219,18 @@ PYTHONPATH=src poetry run python inference_demo.py
 | Symptom | Likely cause / fix |
 |---|---|
 | `scp: Permission denied (publickey)` | SSH key not registered on Vast. Add under *Account → SSH keys*, destroy+recreate instance. |
-| OOM during training | Reduce `--batch-size` (try 64, then 32). Current ~10M model should fit batch=128 on 32 GB easily. |
-| `torch.cuda.is_available()` returns False on remote | Template lacks CUDA PyTorch. `poetry run python -c "import torch; print(torch.__version__)"` — reinstall with `pip install torch --index-url https://download.pytorch.org/whl/cu121`. |
+| OOM during training | Reduce `--batch-size` (try 256, then 128). The ~10M param model should fit batch=512 on 24 GB easily. |
+| `torch.cuda.is_available()` returns False | Template lacks CUDA PyTorch. Run `python -c "import torch; print(torch.__version__)"` — if no `+cu` suffix, reinstall: `pip install torch --index-url https://download.pytorch.org/whl/cu121`. |
 | TensorBoard connection refused | `--bind_all` flag missing, or forgot `-L 6006:localhost:6006` on the ssh command. |
-| Phase 2 `task_mse` not descending | `distill_lambda` may be too high — try 0.01 or 0. If phase-1 weights are bad, something is off upstream. |
-| Instance destroyed mid-training | `reward_model_phase1.pt` saves after phase 1 — resume by loading that checkpoint and running only phase 2 (requires a small code tweak to skip phase 1 if a checkpoint is passed in). |
-| Memmap shape mismatch error | The `.bin` files and `_meta.pt` must match — if you re-ran `build_datasets.py` with `--force`, re-transfer all `outcome_*` and `stockfish_*` files. |
+| `train/epoch_loss` not descending | Learning rate may be too low/high — try `--learning-rate 1e-4`. |
+| Memmap shape mismatch error | The `.bin` files and `_meta.pt` must match — if you re-ran `build_datasets.py --force`, re-transfer all `stockfish_*` files. |
 
 ---
 
 ## Cost reality check
 
-At ~$0.50/hr for the ~32 GB DLPerf-199 card we scoped:
-- Full training run: ~$1.50–3.00
+At ~$0.50/hr for a 24 GB card:
+- Full training run: ~$1–2
 - Idle instance while you sleep: **$12/day** — always destroy when done.
 
 Build datasets locally (CPU-only work), do the GPU-intensive parts in a single focused session, and tear down.
