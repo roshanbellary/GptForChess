@@ -1,5 +1,8 @@
 ## Experiment 2: My Model Is Low IQ
 
+![Phase 2 Batch Loss](phase2_batch_loss.jpg)
+![Phase 2 Epoch Distill Loss](phase2_epoch_distill.jpg)
+![Phase 2 Epoch MSE Loss](phase2_epoch_mse.jpg)
 Played against the reward model with a couple of different positions. Start game has vastly improved from the stockfish training which is great :) However...model has horrible endgame and misevaluates its position entirely when it comes to endgame. I had model
 in a checkmate position in 3 moves; however, model continually thought it had +0.9 odds of winning. Thus, I need to reevaluate how
 I'm doing training for the model.

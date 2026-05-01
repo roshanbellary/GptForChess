@@ -193,7 +193,7 @@ import chess
 import torch
 
 from model import ChessRewardModel, RewardModelInference
-from mcts import MinimaxSearch
+from minimax import MinimaxSearch
 
 tokenizer = torch.load("data/tokenizer.pt", weights_only=False)
 model = ChessRewardModel(vocab_size=tokenizer.language_size)

@@ -5,6 +5,8 @@ Run from repo root:
     PYTHONPATH=src poetry run python demo.py
 """
 import sys
+import os
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
 import threading
 import chess
 import torch
@@ -210,7 +212,7 @@ def promote_dialog(surf, label_font, color: chess.Color) -> chess.PieceType:
 
 def main():
     from model import ChessRewardModel, RewardModelInference
-    from mcts import MinimaxSearch
+    from minimax import MinimaxSearch
 
     pygame.init()
     surf = pygame.display.set_mode((W, H))

@@ -1,6 +1,6 @@
 import chess
 import pytest
-from mcts import MinimaxSearch, dummy_reward_fn
+from minimax import MinimaxSearch, dummy_reward_fn
 
 
 class TestMinimaxSearch:
