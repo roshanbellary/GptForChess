@@ -1,9 +1,9 @@
 import argparse
 import atexit
-import math
+import contextlib
+import math  # noqa: F401 (used in eval_policy)
 import multiprocessing as mp
 import re
-import random
 import shutil
 import time
 import numpy as np
@@ -17,7 +17,7 @@ from torch.utils.tensorboard import SummaryWriter
 from datasets import load_dataset
 
 from tokenizer import Tokenizer
-from model import ChessRewardModel, DummyRewardModel, CLS_TOKEN, PAD_TOKEN
+from model import ChessRewardModel, ChessPolicyModel, DummyRewardModel, CLS_TOKEN, PAD_TOKEN
 
 STOCKFISH_PATH = shutil.which("stockfish") or "/usr/local/bin/stockfish"
 
@@ -120,148 +120,88 @@ def load_filtered_dataset(min_elo: int = 1500, min_rows: int = 100_000):
     return rows
 
 
-def _enumerate_all_san_moves() -> list[str]:
-    """Generate every SAN move string that can legally appear in a chess game.
+def _enumerate_all_uci_moves() -> list[str]:
+    """Enumerate every UCI move string that can legally appear in a chess game.
 
-    Constructs synthetic positions to cover: all piece moves, captures,
-    file/rank/square disambiguation, pawn promotions, and check/checkmate
-    suffixes (python-chess appends + and # automatically).
+    Uses direct geometric enumeration rather than board simulation to avoid
+    edge cases where king placement blocks valid destination squares.
+    Covers all piece movement patterns: lines (rook/queen), diagonals
+    (bishop/queen), L-shapes (knight), and pawn promotions.
     """
     seen: set[str] = set()
-
-    def collect(board: chess.Board) -> None:
-        for move in board.legal_moves:
-            try:
-                seen.add(board.san(move))
-            except Exception:
-                pass
-
-    def place_kings(board: chess.Board, occupied: set[int]) -> bool:
-        """Place both kings on non-adjacent empty squares far from the action."""
-        w_sq = b_sq = None
-        for sq in reversed(chess.SQUARES):  # start from h8 to avoid blocking rank 1
-            if sq in occupied:
+    for from_sq in chess.SQUARES:
+        fr = chess.square_rank(from_sq)
+        ff = chess.square_file(from_sq)
+        for to_sq in chess.SQUARES:
+            if from_sq == to_sq:
                 continue
-            if w_sq is None:
-                w_sq = sq
+            tr = chess.square_rank(to_sq)
+            tf = chess.square_file(to_sq)
+            dr = abs(tr - fr)
+            df = abs(tf - ff)
+
+            is_line   = (dr == 0 or df == 0)                           # rook / queen
+            is_diag   = (dr == df)                                      # bishop / queen
+            is_knight = (dr == 2 and df == 1) or (dr == 1 and df == 2)
+
+            if not (is_line or is_diag or is_knight):
                 continue
-            if chess.square_distance(sq, w_sq) > 1:
-                b_sq = sq
-                break
-        if w_sq is None or b_sq is None:
-            return False
-        board.set_piece_at(w_sq, chess.Piece(chess.KING, chess.WHITE))
-        board.set_piece_at(b_sq, chess.Piece(chess.KING, chess.BLACK))
-        return True
 
-    for color in (chess.WHITE, chess.BLACK):
-        opp = not color
+            seen.add(chess.Move(from_sq, to_sq).uci())
 
-        for piece_type in (chess.PAWN, chess.KNIGHT, chess.BISHOP,
-                           chess.ROOK, chess.QUEEN, chess.KING):
-            for from_sq in chess.SQUARES:
-                rank = chess.square_rank(from_sq)
-                # Pawns can't sit on their own back rank or promotion rank
-                if piece_type == chess.PAWN:
-                    if color == chess.WHITE and rank in (0, 7):
-                        continue
-                    if color == chess.BLACK and rank in (0, 7):
-                        continue
-
-                # ── basic move (no captures) ──────────────────────────────
-                b = chess.Board(None)
-                b.turn = color
-                b.set_piece_at(from_sq, chess.Piece(piece_type, color))
-                occupied = {from_sq}
-                if piece_type != chess.KING:
-                    if not place_kings(b, occupied):
-                        continue
-                else:
-                    # Only need the opposing king
-                    for ksq in chess.SQUARES:
-                        if ksq not in occupied and chess.square_distance(ksq, from_sq) > 1:
-                            b.set_piece_at(ksq, chess.Piece(chess.KING, opp))
-                            break
-                collect(b)
-
-                # ── captures: enemy pawn on each reachable square ─────────
-                if piece_type != chess.KING:
-                    for cap_sq in chess.SQUARES:
-                        if b.piece_at(cap_sq):
-                            continue
-                        b2 = b.copy()
-                        b2.set_piece_at(cap_sq, chess.Piece(chess.PAWN, opp))
-                        collect(b2)
-
-                # ── disambiguation: add a second friendly piece ───────────
-                if piece_type not in (chess.PAWN, chess.KING):
-                    for sq2 in chess.SQUARES:
-                        if b.piece_at(sq2):
-                            continue
-                        b3 = b.copy()
-                        b3.set_piece_at(sq2, chess.Piece(piece_type, color))
-                        collect(b3)
-                        # ── disambiguation + capture ──────────────────────
-                        for cap_sq in chess.SQUARES:
-                            if b3.piece_at(cap_sq):
-                                continue
-                            b4 = b3.copy()
-                            b4.set_piece_at(cap_sq, chess.Piece(chess.PAWN, opp))
-                            collect(b4)
-
-    # Promotions: kings placed on rank 3 (away from promotion ranks 1 and 8)
-    # so promotion squares aren't automatically checks.
-    for color in (chess.WHITE, chess.BLACK):
-        opp = not color
-        promo_rank = 6 if color == chess.WHITE else 1  # 7th rank, 0-indexed
-        dest_rank  = 7 if color == chess.WHITE else 0
-        for file in range(8):
-            from_sq = chess.square(file, promo_rank)
-            b = chess.Board(None)
-            b.turn = color
-            b.set_piece_at(from_sq, chess.Piece(chess.PAWN, color))
-            # Kings mid-board on rank 3, away from promotion diagonals
-            b.set_piece_at(chess.square(0, 3), chess.Piece(chess.KING, chess.WHITE))
-            b.set_piece_at(chess.square(2, 3), chess.Piece(chess.KING, chess.BLACK))
-            collect(b)
-            # Capture-promotions: enemy piece on adjacent diagonal squares
-            for df in (-1, 1):
-                cap_file = file + df
-                if 0 <= cap_file < 8:
-                    cap_sq = chess.square(cap_file, dest_rank)
-                    b2 = b.copy()
-                    if not b2.piece_at(cap_sq):
-                        b2.set_piece_at(cap_sq, chess.Piece(chess.ROOK, opp))
-                        collect(b2)
-
-    # Castling suffixes not produced by the above (no room for rooks + kings
-    # in the tight board setups), so add them explicitly.
-    for suffix in ('', '+', '#'):
-        seen.add('O-O' + suffix)
-        seen.add('O-O-O' + suffix)
+            # Promotion variants: pawn on 7th rank advancing to 8th (or 2nd→1st)
+            if ((fr == 6 and tr == 7) or (fr == 1 and tr == 0)) and df <= 1:
+                for promo in (chess.QUEEN, chess.ROOK, chess.BISHOP, chess.KNIGHT):
+                    seen.add(chess.Move(from_sq, to_sq, promotion=promo).uci())
 
     return list(seen)
 
 
-def build_tokenizer_from_games(games: list[dict], max_language_size) -> Tokenizer:
-    """Build a move-level tokenizer from filtered HuggingFace games."""
-    # Seed corpus with every possible SAN move so no inference position
-    # can produce an unknown token.
-    all_moves: list[str] = _enumerate_all_san_moves()
-    print(f"  seeded tokenizer with {len(set(all_moves)):,} synthetic SAN moves")
+def _weighted_sample(eligible: list[int], k: int, skew_exponent: float, seed: int) -> set[int]:
+    """Sample k positions from eligible without replacement, skewed toward later positions.
 
-    for game in games:
-        movetext = game.get("movetext", "")
-        if not movetext:
-            continue
-        all_moves.extend(parse_movetext(movetext))
+    Weights grow as (position_rank + 1)^skew_exponent so later positions in a game
+    are proportionally more likely to be selected. skew_exponent=1.0 gives linear
+    weighting; higher values concentrate more mass at the end of the game.
+    """
+    n = len(eligible)
+    k = min(k, n)
+    if k == n:
+        return set(eligible)
+    weights = np.array([(i + 1) ** skew_exponent for i in range(n)], dtype=np.float64)
+    weights /= weights.sum()
+    rng = np.random.default_rng(seed)
+    chosen = rng.choice(n, size=k, replace=False, p=weights)
+    return {eligible[i] for i in chosen}
 
+
+def build_tokenizer_from_games(games: list[dict] | None = None) -> Tokenizer:
+    """Build a move-level tokenizer covering all 1968 UCI moves."""
+    uci_moves = _enumerate_all_uci_moves()
+    print(f"  building tokenizer from {len(set(uci_moves)):,} UCI moves (no BPE)")
     tokenizer = Tokenizer()
-    unique_count = len(set(all_moves))
-    lang_size = max(unique_count, max_language_size)
-    tokenizer.train_tokenizer(all_moves, max_language_size=lang_size)
+    tokenizer.train_tokenizer(uci_moves, max_language_size=len(set(uci_moves)))
     tokenizer.add_special_tokens([CLS_TOKEN, PAD_TOKEN])
     return tokenizer
+
+
+def _load_train_idx(out_dir: Path, name: str, n: int) -> np.ndarray | None:
+    """If `{name}_test_indices.npy` exists, return the complement (training-only
+    indices into the full memmap). Returns None when no test split is recorded —
+    in that case the caller indexes into the memmap directly.
+
+    Names ending in '_test' always return None (the test memmap should not
+    exclude itself).
+    """
+    if name.endswith("_test"):
+        return None
+    test_idx_file = out_dir / f"{name}_test_indices.npy"
+    if not test_idx_file.exists():
+        return None
+    test_idx = np.load(test_idx_file)
+    mask = np.ones(n, dtype=bool)
+    mask[test_idx] = False
+    return np.where(mask)[0]
 
 
 class ChessPositionDataset(Dataset):
@@ -270,46 +210,45 @@ class ChessPositionDataset(Dataset):
         games: list[dict],
         tokenizer: Tokenizer,
         eval_fn=material_eval,
-        max_positions_per_game: int = 10,
-        skip_ply: int = 0,
+        sample_rate: float = 0.25,
+        skew_exponent: float = 1.5,
     ):
         self.tokenizer = tokenizer
         self.cls_id = tokenizer.symbol_to_token[CLS_TOKEN]
         self.samples: list[tuple[list[int], float]] = []
         self._memmap = False
-        self._generate_samples(games, eval_fn, max_positions_per_game, skip_ply)
+        self._train_idx: np.ndarray | None = None
+        self._generate_samples(games, eval_fn, sample_rate, skew_exponent)
 
-    def _generate_samples(self, games, eval_fn, max_positions_per_game, skip_ply):
+    def _generate_samples(self, games, eval_fn, sample_rate, skew_exponent):
         for idx, game in enumerate(games):
             movetext = game.get("movetext", "")
             if not movetext:
                 continue
             move_sans = parse_movetext(movetext)
-            if len(move_sans) < max(2, skip_ply + 1):
+            if len(move_sans) < 2:
                 continue
 
             board = chess.Board()
-            eligible = list(range(skip_ply, len(move_sans)))
-            num_positions = min(max_positions_per_game, len(eligible))
-            # Per-game deterministic sampling (seeded by game index) so serial
+            eligible = list(range(len(move_sans)))
+            # Scale sample count with game length — longer games have more
+            # evaluation swings and contribute proportionally more samples.
+            num_positions = max(1, int(len(move_sans) * sample_rate))
+            # Deterministic weighted sampling seeded by game index so serial
             # and parallel paths produce identical sample sets for the same input.
-            rng = random.Random(idx)
-            sample_indices = set(rng.sample(eligible, num_positions))
+            sample_indices = _weighted_sample(eligible, num_positions, skew_exponent, seed=idx)
 
             valid_moves = []
             for i, san in enumerate(move_sans):
                 try:
                     move = board.parse_san(san)
                     board.push(move)
-                    valid_moves.append(san)
+                    valid_moves.append(move.uci())
                 except (chess.InvalidMoveError, chess.AmbiguousMoveError):
                     break
 
                 if i in sample_indices:
-                    try:
-                        token_ids = [self.cls_id] + self.tokenizer.encode_moves(valid_moves)
-                    except KeyError:
-                        continue
+                    token_ids = [self.cls_id] + self.tokenizer.encode_moves(valid_moves)
                     score = eval_fn(board)
                     self.samples.append((token_ids, score))
 
@@ -318,11 +257,15 @@ class ChessPositionDataset(Dataset):
 
     def __len__(self) -> int:
         if self._memmap:
+            if self._train_idx is not None:
+                return len(self._train_idx)
             return len(self._mm_labels)
         return len(self.samples)
 
     def __getitem__(self, idx: int):
         if self._memmap:
+            if self._train_idx is not None:
+                idx = int(self._train_idx[idx])
             tokens = torch.from_numpy(np.array(self._mm_tokens[idx], dtype=np.int32)).long()
             length = int(self._mm_lengths[idx])
             mask = torch.arange(tokens.shape[0]) >= length  # True = padded
@@ -348,7 +291,12 @@ class ChessPositionDataset(Dataset):
 
     @classmethod
     def from_memmap(cls, out_dir: Path, name: str, tokenizer: Tokenizer):
-        """Load pre-padded samples from memory-mapped arrays (fast DataLoader path)."""
+        """Load pre-padded samples from memory-mapped arrays (fast DataLoader path).
+
+        If a sibling file `{name}_test_indices.npy` exists, those indices are
+        excluded from this dataset — used to make training disjoint from the
+        held-out test split that shares the same underlying .bin file.
+        """
         meta = torch.load(out_dir / f"{name}_meta.pt", weights_only=True)
         n, max_len = meta["n"], meta["max_len"]
         inst = cls.__new__(cls)
@@ -358,6 +306,7 @@ class ChessPositionDataset(Dataset):
         inst._mm_tokens = np.memmap(out_dir / f"{name}_tokens.bin", dtype=np.int32, mode="r", shape=(n, max_len))
         inst._mm_labels = np.memmap(out_dir / f"{name}_labels.bin", dtype=np.float32, mode="r", shape=(n,))
         inst._mm_lengths = np.memmap(out_dir / f"{name}_lengths.bin", dtype=np.int32, mode="r", shape=(n,))
+        inst._train_idx = _load_train_idx(out_dir, name, n)
         return inst
 
 
@@ -377,9 +326,9 @@ class ChessPositionDataset(Dataset):
 _worker_engine = None
 _worker_tokenizer = None
 _worker_cls_id = None
-_worker_max_positions = None
+_worker_sample_rate = None
+_worker_skew = None
 _worker_depth = None
-_worker_skip_ply = 0
 
 
 def _shutdown_worker():
@@ -393,19 +342,19 @@ def _shutdown_worker():
         _worker_engine = None
 
 
-def _init_worker(engine_path, depth, tokenizer, cls_id, max_positions_per_game, skip_ply):
+def _init_worker(engine_path, depth, tokenizer, cls_id, sample_rate, skew_exponent):
     """Pool initializer: create one Stockfish engine per worker.
 
     If engine_path is None, workers fall back to material_eval. This lets
     tests exercise the parallel machinery without requiring Stockfish.
     """
     global _worker_engine, _worker_tokenizer, _worker_cls_id
-    global _worker_max_positions, _worker_depth, _worker_skip_ply
+    global _worker_sample_rate, _worker_skew, _worker_depth
     _worker_tokenizer = tokenizer
     _worker_cls_id = cls_id
-    _worker_max_positions = max_positions_per_game
+    _worker_sample_rate = sample_rate
+    _worker_skew = skew_exponent
     _worker_depth = depth
-    _worker_skip_ply = skip_ply
     if engine_path is not None:
         _worker_engine = chess.engine.SimpleEngine.popen_uci(engine_path)
         atexit.register(_shutdown_worker)
@@ -430,13 +379,12 @@ def _process_game(game_with_seed):
     if not movetext:
         return []
     move_sans = parse_movetext(movetext)
-    if len(move_sans) < max(2, _worker_skip_ply + 1):
+    if len(move_sans) < 2:
         return []
 
-    rng = random.Random(seed)
-    eligible = list(range(_worker_skip_ply, len(move_sans)))
-    num_positions = min(_worker_max_positions, len(eligible))
-    sample_indices = set(rng.sample(eligible, num_positions))
+    eligible = list(range(len(move_sans)))
+    num_positions = max(1, int(len(move_sans) * _worker_sample_rate))
+    sample_indices = _weighted_sample(eligible, num_positions, _worker_skew, seed=seed)
 
     samples = []
     board = chess.Board()
@@ -445,15 +393,12 @@ def _process_game(game_with_seed):
         try:
             move = board.parse_san(san)
             board.push(move)
-            valid_moves.append(san)
+            valid_moves.append(move.uci())
         except (chess.InvalidMoveError, chess.AmbiguousMoveError):
             break
 
         if i in sample_indices:
-            try:
-                token_ids = [_worker_cls_id] + _worker_tokenizer.encode_moves(valid_moves)
-            except KeyError:
-                continue  # rare SAN not in vocab — skip this position
+            token_ids = [_worker_cls_id] + _worker_tokenizer.encode_moves(valid_moves)
             score = _worker_eval(board)
             samples.append((token_ids, score))
 
@@ -465,11 +410,11 @@ def generate_samples_stockfish_parallel(
     tokenizer: Tokenizer,
     num_workers: int = 8,
     stockfish_depth: int = 12,
-    max_positions_per_game: int = 10,
+    sample_rate: float = 0.25,
+    skew_exponent: float = 1.5,
     engine_path: str | None = STOCKFISH_PATH,
     chunksize: int = 8,
     progress_every: int = 1000,
-    skip_ply: int = 0,
 ) -> list[tuple[list[int], float]]:
     """Parallel Stockfish-backed sample generation.
 
@@ -477,13 +422,9 @@ def generate_samples_stockfish_parallel(
     If `engine_path` is None, workers use material_eval instead of Stockfish
     (used by tests to verify the parallel machinery without the binary).
 
-    `skip_ply` drops the first N plies of each game before sampling (useful
-    for discarding opening-theory noise where position labels carry weak
-    signal).
-
-    Sampling is seeded per-game-index, so the returned sample set is
-    deterministic across runs and across worker counts (though the order
-    is not, since we use imap_unordered).
+    Each game contributes `max(1, game_length * sample_rate)` positions,
+    weighted toward mid/late game by `skew_exponent`. Sampling is seeded
+    per-game-index for determinism across runs and worker counts.
     """
     cls_id = tokenizer.symbol_to_token[CLS_TOKEN]
     tasks = [(game, idx) for idx, game in enumerate(games)]
@@ -495,7 +436,7 @@ def generate_samples_stockfish_parallel(
     with ctx.Pool(
         processes=num_workers,
         initializer=_init_worker,
-        initargs=(engine_path, stockfish_depth, tokenizer, cls_id, max_positions_per_game, skip_ply),
+        initargs=(engine_path, stockfish_depth, tokenizer, cls_id, sample_rate, skew_exponent),
     ) as pool:
         for i, game_samples in enumerate(
             pool.imap_unordered(_process_game, tasks, chunksize=chunksize)
@@ -531,13 +472,108 @@ def collate_fn_memmap(batch):
     return torch.stack(tokens), torch.stack(masks), torch.tensor(labels, dtype=torch.float)
 
 
+def collate_fn_policy(batch):
+    """Pad token sequences for policy training — yields (tokens, mask), no labels."""
+    max_len = max(len(t) for t in batch)
+    padded = torch.zeros(len(batch), max_len, dtype=torch.long)
+    mask = torch.ones(len(batch), max_len, dtype=torch.bool)  # True = padded
+    for i, t in enumerate(batch):
+        padded[i, :len(t)] = t
+        mask[i, :len(t)] = False
+    return padded, mask
+
+
+class ChessPolicyDataset(Dataset):
+    """Full game sequences for next-move prediction training.
+
+    Each sample is [CLS, m1, m2, ..., mN] — the complete tokenized move list
+    for one game, truncated to max_seq_len. Unlike ChessPositionDataset there
+    are no external labels; targets are derived from the sequence itself in
+    _run_epoch_policy.
+    """
+    def __init__(self, games: list[dict], tokenizer: Tokenizer, max_seq_len: int = 128):
+        cls_id = tokenizer.symbol_to_token[CLS_TOKEN]
+        self._memmap = False
+        self._train_idx: np.ndarray | None = None
+        self.samples: list[list[int]] = []
+        for game in games:
+            movetext = game.get("movetext", "")
+            if not movetext:
+                continue
+            move_sans = parse_movetext(movetext)
+            if len(move_sans) < 2:
+                continue
+            board = chess.Board()
+            move_ucis: list[str] = []
+            for san in move_sans:
+                try:
+                    move = board.parse_san(san)
+                    board.push(move)
+                    move_ucis.append(move.uci())
+                except (chess.InvalidMoveError, chess.AmbiguousMoveError):
+                    break
+            if len(move_ucis) < 2:
+                continue
+            move_ucis = move_ucis[:max_seq_len - 1]  # reserve slot for CLS
+            self.samples.append([cls_id] + tokenizer.encode_moves(move_ucis))
+
+    def __len__(self) -> int:
+        if self._memmap:
+            if self._train_idx is not None:
+                return len(self._train_idx)
+            return len(self._mm_lengths)
+        return len(self.samples)
+
+    def __getitem__(self, idx: int) -> torch.Tensor:
+        if self._memmap:
+            if self._train_idx is not None:
+                idx = int(self._train_idx[idx])
+            length = int(self._mm_lengths[idx])
+            return torch.from_numpy(np.array(self._mm_tokens[idx, :length], dtype=np.int32)).long()
+        return torch.tensor(self.samples[idx], dtype=torch.long)
+
+    @classmethod
+    def from_memmap(cls, out_dir: Path, tokenizer: Tokenizer, name: str = "policy"):
+        """Load pre-tokenized policy sequences from memory-mapped arrays.
+
+        Args:
+            name: filename prefix; use 'puzzle' to load puzzle_*.bin files.
+
+        If a sibling file `{name}_test_indices.npy` exists, those indices are
+        excluded from this dataset — used to make training disjoint from the
+        held-out test split that shares the same underlying .bin file.
+        """
+        meta = torch.load(out_dir / f"{name}_meta.pt", weights_only=True)
+        n, max_len = meta["n"], meta["max_len"]
+        inst = cls.__new__(cls)
+        inst._memmap = True
+        inst._mm_tokens = np.memmap(out_dir / f"{name}_tokens.bin", dtype=np.int32, mode="r", shape=(n, max_len))
+        inst._mm_lengths = np.memmap(out_dir / f"{name}_lengths.bin", dtype=np.int32, mode="r", shape=(n,))
+        inst._train_idx = _load_train_idx(out_dir, name, n)
+        return inst
+
+
 def _fmt_duration(seconds: float) -> str:
     h, m = divmod(int(seconds), 3600)
     m, s = divmod(m, 60)
     return f"{h}h {m:02d}m {s:02d}s" if h else f"{m}m {s:02d}s"
 
 
-def _run_epoch(model, loader, optimizer, device, writer, global_step, epoch_idx):
+def _amp_ctx(device):
+    """BF16 autocast on CUDA, no-op elsewhere.
+
+    BF16 is preferred over FP16 here: same dynamic range as FP32 (no GradScaler
+    needed) and full tensor-core acceleration on Ampere+ / Ada / Blackwell.
+    On Blackwell (RTX PRO 6000 / B200) this typically gives 2-3x training speedup
+    on transformer matmuls.
+    """
+    dev = device if isinstance(device, str) else getattr(device, "type", "cpu")
+    if dev == "cuda":
+        return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+    return contextlib.nullcontext()
+
+
+def _run_epoch_reward(model, loader, optimizer, device, writer, global_step, epoch_idx):
     """Single training epoch: MSE against Stockfish labels."""
     model.train()
     total_loss = 0.0
@@ -550,8 +586,9 @@ def _run_epoch(model, loader, optimizer, device, writer, global_step, epoch_idx)
         batch_mask = batch_mask.to(device)
         batch_labels = batch_labels.to(device)
 
-        predictions = model(batch_tokens, attention_mask=batch_mask)
-        loss = F.mse_loss(predictions, batch_labels)
+        with _amp_ctx(device):
+            predictions = model(batch_tokens, attention_mask=batch_mask)
+            loss = F.mse_loss(predictions, batch_labels)
 
         optimizer.zero_grad()
         loss.backward()
@@ -559,7 +596,7 @@ def _run_epoch(model, loader, optimizer, device, writer, global_step, epoch_idx)
         optimizer.step()
         total_loss += loss.item()
 
-        writer.add_scalar("train/batch_loss", loss.item(), global_step)
+        writer.add_scalar("train/reward_batch_loss", loss.item(), global_step)
         global_step += 1
 
         if (i + 1) % log_every == 0 or (i + 1) == n_batches:
@@ -577,32 +614,297 @@ def _run_epoch(model, loader, optimizer, device, writer, global_step, epoch_idx)
 
     epoch_elapsed = time.time() - epoch_start
     avg = total_loss / n_batches
-    writer.add_scalar("train/epoch_loss", avg, epoch_idx)
+    writer.add_scalar("train/reward_epoch_loss", avg, epoch_idx)
     return avg, global_step, epoch_elapsed
+
+def _run_epoch_policy(model, loader, optimizer, device, writer, global_step, epoch_idx, pad_id):
+    """Single training epoch: GPT-style cross-entropy at every position.
+
+    For each sequence [CLS, m1, ..., mN], the model receives [CLS, m1, ..., m_{N-1}]
+    and must predict [m1, m2, ..., mN] at every position simultaneously.
+    PAD positions are excluded from the loss via ignore_index.
+
+    Loader must yield (batch_tokens, batch_mask) — no external labels.
+    """
+    model.train()
+    total_loss = 0.0
+    n_batches = len(loader)
+    log_every = max(1, n_batches // 20)
+    epoch_start = time.time()
+
+    for i, (batch_tokens, batch_mask) in enumerate(loader):
+        batch_tokens = batch_tokens.to(device)
+        batch_mask = batch_mask.to(device)
+
+        # input: all tokens except last; target: all tokens except first (shifted by 1)
+        input_tokens = batch_tokens[:, :-1]         # (batch, seq_len-1)
+        input_mask = batch_mask[:, :-1]             # (batch, seq_len-1)
+        targets = batch_tokens[:, 1:].contiguous()  # (batch, seq_len-1)
+
+        with _amp_ctx(device):
+            logits = model(input_tokens, attention_mask=input_mask)  # (batch, seq_len-1, vocab_size)
+            # flatten to (batch*(seq_len-1), vocab_size) — ignore_index skips PAD targets
+            loss = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)),
+                targets.reshape(-1),
+                ignore_index=pad_id,
+            )
+
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+        total_loss += loss.item()
+
+        writer.add_scalar("train_policy/batch_loss", loss.item(), global_step)
+        global_step += 1
+
+        if (i + 1) % log_every == 0 or (i + 1) == n_batches:
+            elapsed = time.time() - epoch_start
+            batches_done = i + 1
+            eta = elapsed / batches_done * (n_batches - batches_done)
+            samples_per_sec = batches_done * batch_tokens.size(0) / elapsed
+            avg_so_far = total_loss / batches_done
+            print(
+                f"    batch {batches_done:,}/{n_batches:,}  "
+                f"loss={avg_so_far:.4f}  "
+                f"{samples_per_sec:,.0f} samples/s  "
+                f"eta {_fmt_duration(eta)}"
+            )
+
+    epoch_elapsed = time.time() - epoch_start
+    avg = total_loss / n_batches
+    writer.add_scalar("train_policy/epoch_loss", avg, epoch_idx)
+    return avg, global_step, epoch_elapsed
+
+
+def _run_epoch_policy_puzzle(model, loader, optimizer, device, writer, global_step, epoch_idx, pad_id):
+    """Puzzle fine-tuning epoch: cross-entropy on solver and opp-defensive moves.
+
+    Sequence layout: [CLS, S, m1, opp1, m2, opp2, m3, ...]
+    Only the setup move S is masked from loss — it's the opponent's forcing move
+    that defines the puzzle, given as context (P[m_n | S, m_{<n}]).
+
+    Solver moves (m1, m2, ...) and Lichess's chosen opponent responses (opp1,
+    opp2, ...) both contribute to loss. The opp moves aren't arbitrary — Lichess
+    picks the engine's best defensive continuation (the move that delays loss
+    longest or holds the position), so training on them teaches the model what
+    strong defensive play looks like. That structural signal is genuinely useful
+    and doesn't appear cleanly in full-game training data.
+    """
+    model.train()
+    total_loss = 0.0
+    n_batches = len(loader)
+    log_every = max(1, n_batches // 20)
+    epoch_start = time.time()
+
+    for i, (batch_tokens, batch_mask) in enumerate(loader):
+        batch_tokens = batch_tokens.to(device)
+        batch_mask = batch_mask.to(device)
+
+        input_tokens = batch_tokens[:, :-1]
+        input_mask = batch_mask[:, :-1]
+        targets = batch_tokens[:, 1:].contiguous()
+        targets[:, 0] = pad_id  # mask only the setup move (S) from loss
+
+        with _amp_ctx(device):
+            logits = model(input_tokens, attention_mask=input_mask)
+            loss = F.cross_entropy(
+                logits.reshape(-1, logits.size(-1)),
+                targets.reshape(-1),
+                ignore_index=pad_id,
+            )
+
+        optimizer.zero_grad()
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        optimizer.step()
+        total_loss += loss.item()
+
+        writer.add_scalar("train_puzzle/batch_loss", loss.item(), global_step)
+        global_step += 1
+
+        if (i + 1) % log_every == 0 or (i + 1) == n_batches:
+            elapsed = time.time() - epoch_start
+            batches_done = i + 1
+            eta = elapsed / batches_done * (n_batches - batches_done)
+            samples_per_sec = batches_done * batch_tokens.size(0) / elapsed
+            avg_so_far = total_loss / batches_done
+            print(
+                f"    batch {batches_done:,}/{n_batches:,}  "
+                f"loss={avg_so_far:.4f}  "
+                f"{samples_per_sec:,.0f} samples/s  "
+                f"eta {_fmt_duration(eta)}"
+            )
+
+    epoch_elapsed = time.time() - epoch_start
+    avg = total_loss / n_batches
+    writer.add_scalar("train_puzzle/epoch_loss", avg, epoch_idx)
+    return avg, global_step, epoch_elapsed
+
+
+def eval_reward(model, loader, device) -> dict:
+    """Evaluate reward model on a test loader. Returns MSE, MAE, and Pearson r."""
+    model.eval()
+    all_preds, all_labels = [], []
+    with torch.no_grad(), _amp_ctx(device):
+        for batch_tokens, batch_mask, batch_labels in loader:
+            preds = model(batch_tokens.to(device), attention_mask=batch_mask.to(device))
+            all_preds.append(preds.float().cpu())
+            all_labels.append(batch_labels)
+    preds = torch.cat(all_preds)
+    labels = torch.cat(all_labels)
+    mse = F.mse_loss(preds, labels).item()
+    mae = (preds - labels).abs().mean().item()
+    # Pearson r
+    p_centered = preds - preds.mean()
+    l_centered = labels - labels.mean()
+    denom = (p_centered.norm() * l_centered.norm()).clamp(min=1e-8)
+    pearson_r = (p_centered * l_centered).sum() / denom
+    return {"mse": mse, "mae": mae, "pearson_r": pearson_r.item()}
+
+
+def eval_policy(model, loader, device, pad_id: int) -> dict:
+    """Evaluate policy model on a test loader. Returns loss, perplexity, top-1/top-5 acc."""
+    model.eval()
+    total_loss = 0.0
+    total_correct1 = 0
+    total_correct5 = 0
+    total_positions = 0
+    with torch.no_grad(), _amp_ctx(device):
+        for batch_tokens, batch_mask in loader:
+            batch_tokens = batch_tokens.to(device)
+            batch_mask = batch_mask.to(device)
+            input_tokens = batch_tokens[:, :-1]
+            input_mask = batch_mask[:, :-1]
+            targets = batch_tokens[:, 1:].contiguous()
+            logits = model(input_tokens, attention_mask=input_mask)
+            flat_logits = logits.reshape(-1, logits.size(-1))
+            flat_targets = targets.reshape(-1)
+            valid = flat_targets != pad_id
+            total_loss += F.cross_entropy(flat_logits, flat_targets, ignore_index=pad_id, reduction="sum").item()
+            total_positions += valid.sum().item()
+            top5 = flat_logits[valid].topk(5, dim=-1).indices
+            valid_targets = flat_targets[valid]
+            total_correct1 += (top5[:, 0] == valid_targets).sum().item()
+            total_correct5 += (top5 == valid_targets.unsqueeze(1)).any(dim=1).sum().item()
+    avg_loss = total_loss / max(total_positions, 1)
+    return {
+        "loss": avg_loss,
+        "perplexity": math.exp(min(avg_loss, 20)),
+        "top1_acc": total_correct1 / max(total_positions, 1),
+        "top5_acc": total_correct5 / max(total_positions, 1),
+    }
+
+
+def eval_puzzle_solve_rate(model, loader, device, pad_id: int) -> dict:
+    """Evaluate puzzle solve rate: % of solver positions where model's top-1 matches
+    ground truth. Sequence layout: [CLS, setup, solver1, opp1, solver2, ...]
+
+    Solver moves are at token positions 2, 4, 6, ... (logit positions 1, 3, 5, ...).
+    The setup move at token position 1 (logit 0) is excluded — it's context, not a
+    prediction target. Also reports first-move solve rate (logit position 1 only).
+    """
+    model.eval()
+    first_correct = 0
+    first_total = 0
+    all_correct = 0
+    all_total = 0
+    with torch.no_grad(), _amp_ctx(device):
+        for batch_tokens, batch_mask in loader:
+            batch_tokens = batch_tokens.to(device)
+            batch_mask = batch_mask.to(device)
+            input_tokens = batch_tokens[:, :-1]
+            input_mask = batch_mask[:, :-1]
+            logits = model(input_tokens, attention_mask=input_mask)
+            seq_len = batch_tokens.size(1)
+            # Solver logit positions: 1, 3, 5, ... → target positions: 2, 4, 6, ...
+            for solver_logit_pos in range(1, seq_len - 1, 2):
+                solver_token_pos = solver_logit_pos + 1
+                if solver_token_pos >= seq_len:
+                    break
+                targets = batch_tokens[:, solver_token_pos]
+                valid = targets != pad_id
+                if not valid.any():
+                    continue
+                preds = logits[:, solver_logit_pos].argmax(dim=-1)
+                correct = (preds[valid] == targets[valid]).sum().item()
+                n_valid = valid.sum().item()
+                all_correct += correct
+                all_total += n_valid
+                if solver_logit_pos == 1:
+                    first_correct += correct
+                    first_total += n_valid
+    return {
+        "first_move_solve_rate": first_correct / max(first_total, 1),
+        "all_moves_solve_rate": all_correct / max(all_total, 1),
+    }
 
 
 def train(
     tokenizer_path,
     stockfish_samples_path,
+    outcome_games_path,
     epochs,
+    policy_epochs,
     batch_size,
     learning_rate,
     max_seq_len,
     log_dir,
     num_workers,
+    puzzle_data_dir=None,
+    puzzle_epochs=5,
 ):
-    """Train the reward model from scratch on Stockfish-labeled positions.
+    """Train the reward model then the policy model.
 
-    Requires stockfish memmap files built by src/build_datasets.py.
+    Phase 1: MSE on Stockfish-labeled positions (reward model).
+    Phase 2: Cross-entropy next-move prediction on full game sequences (policy model).
+
+    Requires stockfish memmap files and outcome games built by src/build_datasets.py.
     """
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Using device: {device}")
+    amp_dtype = "bfloat16 autocast" if device == "cuda" else "fp32 (CPU)"
+    print(f"Using device: {device} ({amp_dtype})")
 
     print(f"Loading tokenizer from {tokenizer_path}...")
     tokenizer = torch.load(tokenizer_path, weights_only=False)
     vocab_size = tokenizer.language_size
+    pad_id = tokenizer.symbol_to_token[PAD_TOKEN]
 
+    writer = SummaryWriter(log_dir=log_dir)
+
+    # ── Test loaders (optional, skip silently if test sets not built yet) ───────
     out_dir = Path(stockfish_samples_path).parent
+    reward_test_loader = None
+    if (out_dir / "stockfish_test_meta.pt").exists():
+        reward_test_ds = ChessPositionDataset.from_memmap(out_dir, "stockfish_test", tokenizer)
+        reward_test_loader = DataLoader(
+            reward_test_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn_memmap,
+            num_workers=num_workers, pin_memory=True,
+        )
+        print(f"Reward test set: {len(reward_test_ds):,} positions loaded")
+
+    policy_data_dir_early = Path(outcome_games_path).parent
+    policy_test_loader = None
+    if (policy_data_dir_early / "policy_test_meta.pt").exists():
+        policy_test_ds = ChessPolicyDataset.from_memmap(policy_data_dir_early, tokenizer, name="policy_test")
+        policy_test_loader = DataLoader(
+            policy_test_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn_policy,
+            num_workers=num_workers, pin_memory=True,
+        )
+        print(f"Policy test set: {len(policy_test_ds):,} sequences loaded")
+
+    puzzle_test_loader = None
+    _puzzle_dir = Path(puzzle_data_dir) if puzzle_data_dir is not None else policy_data_dir_early
+    if (_puzzle_dir / "puzzle_test_meta.pt").exists():
+        puzzle_test_ds = ChessPolicyDataset.from_memmap(_puzzle_dir, tokenizer, name="puzzle_test")
+        puzzle_test_loader = DataLoader(
+            puzzle_test_ds, batch_size=batch_size, shuffle=False, collate_fn=collate_fn_policy,
+            num_workers=num_workers, pin_memory=True,
+        )
+        print(f"Puzzle test set: {len(puzzle_test_ds):,} sequences loaded")
+
+    # ── Phase 1: reward model ────────────────────────────────────────────────
     sf_meta = out_dir / "stockfish_meta.pt"
     if sf_meta.exists():
         print(f"Loading Stockfish samples from memmap ({out_dir}/stockfish_*)...")
@@ -612,54 +914,163 @@ def train(
         print(f"Loading Stockfish samples from {stockfish_samples_path}...")
         sf_ds = ChessPositionDataset.from_file(stockfish_samples_path, tokenizer)
         sf_collate = collate_fn
-    print(f"Dataset size: {len(sf_ds):,} positions")
+    print(f"Reward dataset: {len(sf_ds):,} positions")
 
     sf_loader = DataLoader(
         sf_ds, batch_size=batch_size, shuffle=True, collate_fn=sf_collate,
         num_workers=num_workers, pin_memory=True,
     )
 
-    model = ChessRewardModel(vocab_size=vocab_size, max_seq_len=max_seq_len).to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
-    writer = SummaryWriter(log_dir=log_dir)
+    reward_model = ChessRewardModel(vocab_size=vocab_size, max_seq_len=max_seq_len).to(device)
+    reward_optimizer = torch.optim.AdamW(reward_model.parameters(), lr=learning_rate)
     global_step = 0
 
-    print(f"\nTraining: {epochs} epochs, lr={learning_rate}")
-    train_start = time.time()
+    print(f"\n── Phase 1: reward model — {epochs} epochs, lr={learning_rate}")
+    phase1_start = time.time()
     for epoch in range(epochs):
         epoch_num = epoch + 1
         print(f"  [epoch {epoch_num}/{epochs}] starting...")
-        avg_loss, global_step, epoch_secs = _run_epoch(
-            model, sf_loader, optimizer, device, writer, global_step, epoch
+        avg_loss, global_step, epoch_secs = _run_epoch_reward(
+            reward_model, sf_loader, reward_optimizer, device, writer, global_step, epoch
         )
         epochs_left = epochs - epoch_num
-        eta = epoch_secs * epochs_left
         print(
             f"  [epoch {epoch_num}/{epochs}]  "
             f"loss={avg_loss:.4f}  "
             f"epoch_time={_fmt_duration(epoch_secs)}  "
-            f"eta={_fmt_duration(eta)}"
+            f"eta={_fmt_duration(epoch_secs * epochs_left)}"
         )
+        if reward_test_loader is not None:
+            m = eval_reward(reward_model, reward_test_loader, device)
+            writer.add_scalar("test/reward_mse", m["mse"], epoch_num)
+            writer.add_scalar("test/reward_mae", m["mae"], epoch_num)
+            writer.add_scalar("test/reward_pearson_r", m["pearson_r"], epoch_num)
+            print(
+                f"  [test]  mse={m['mse']:.4f}  mae={m['mae']:.4f}  r={m['pearson_r']:.4f}"
+            )
 
-    total_elapsed = time.time() - train_start
-    print(f"Training complete in {_fmt_duration(total_elapsed)}")
-    writer.close()
+    print(f"Phase 1 complete in {_fmt_duration(time.time() - phase1_start)}")
+    torch.save(reward_model.state_dict(), "reward_model.pt")
+    print("Reward model saved to reward_model.pt")
 
-    torch.save(model.state_dict(), "reward_model.pt")
-    print("\nModel saved to reward_model.pt")
-    return model, tokenizer
+    # ── Phase 2a: policy model on game sequences ─────────────────────────────
+    policy_data_dir = policy_data_dir_early  # already computed above
+    policy_meta = policy_data_dir / "policy_meta.pt"
+    if policy_meta.exists():
+        print(f"Loading policy sequences from memmap ({policy_data_dir}/policy_*)...")
+        policy_ds = ChessPolicyDataset.from_memmap(policy_data_dir, tokenizer)
+    else:
+        print(f"Loading outcome games from {outcome_games_path} (tokenizing on-the-fly)...")
+        outcome_games = torch.load(outcome_games_path, weights_only=False)
+        policy_ds = ChessPolicyDataset(outcome_games, tokenizer, max_seq_len=max_seq_len)
+    print(f"Policy dataset: {len(policy_ds):,} sequences")
+
+    policy_loader = DataLoader(
+        policy_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_fn_policy,
+        num_workers=num_workers, pin_memory=True,
+    )
+
+    policy_model = ChessPolicyModel(vocab_size=vocab_size, max_seq_len=max_seq_len).to(device)
+    policy_optimizer = torch.optim.AdamW(policy_model.parameters(), lr=learning_rate)
+    global_step = 0
+
+    def _run_policy_test(epoch_num: int, tb_prefix: str) -> None:
+        if policy_test_loader is not None:
+            m = eval_policy(policy_model, policy_test_loader, device, pad_id)
+            writer.add_scalar(f"{tb_prefix}/policy_loss", m["loss"], epoch_num)
+            writer.add_scalar(f"{tb_prefix}/policy_perplexity", m["perplexity"], epoch_num)
+            writer.add_scalar(f"{tb_prefix}/policy_top1_acc", m["top1_acc"], epoch_num)
+            writer.add_scalar(f"{tb_prefix}/policy_top5_acc", m["top5_acc"], epoch_num)
+            print(
+                f"  [policy test]  loss={m['loss']:.4f}  ppl={m['perplexity']:.2f}"
+                f"  top1={m['top1_acc']:.3f}  top5={m['top5_acc']:.3f}"
+            )
+        if puzzle_test_loader is not None:
+            m = eval_puzzle_solve_rate(policy_model, puzzle_test_loader, device, pad_id)
+            writer.add_scalar(f"{tb_prefix}/puzzle_first_move", m["first_move_solve_rate"], epoch_num)
+            writer.add_scalar(f"{tb_prefix}/puzzle_all_moves", m["all_moves_solve_rate"], epoch_num)
+            print(
+                f"  [puzzle test]  first_move={m['first_move_solve_rate']:.3f}"
+                f"  all_moves={m['all_moves_solve_rate']:.3f}"
+            )
+
+    print(f"\n── Phase 2a: policy model (games) — {policy_epochs} epochs, lr={learning_rate}")
+    phase2a_start = time.time()
+    for epoch in range(policy_epochs):
+        epoch_num = epoch + 1
+        print(f"  [epoch {epoch_num}/{policy_epochs}] starting...")
+        avg_loss, global_step, epoch_secs = _run_epoch_policy(
+            policy_model, policy_loader, policy_optimizer, device, writer, global_step, epoch, pad_id
+        )
+        epochs_left = policy_epochs - epoch_num
+        print(
+            f"  [epoch {epoch_num}/{policy_epochs}]  "
+            f"loss={avg_loss:.4f}  "
+            f"epoch_time={_fmt_duration(epoch_secs)}  "
+            f"eta={_fmt_duration(epoch_secs * epochs_left)}"
+        )
+        _run_policy_test(epoch_num, "test_2a")
+
+    print(f"Phase 2a complete in {_fmt_duration(time.time() - phase2a_start)}")
+    torch.save(policy_model.state_dict(), "policy_model.pt")
+    print("Policy model saved to policy_model.pt")
+
+    # ── Phase 2b: fine-tune policy model on puzzle sequences ─────────────────
+    if puzzle_data_dir is not None and puzzle_epochs > 0:
+        pdir = Path(puzzle_data_dir)
+        puzzle_train_meta = pdir / "puzzle_meta.pt"
+        if puzzle_train_meta.exists():
+            puzzle_ds = ChessPolicyDataset.from_memmap(pdir, tokenizer, name="puzzle")
+            print(f"\nPuzzle training set: {len(puzzle_ds):,} sequences")
+            puzzle_loader = DataLoader(
+                puzzle_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_fn_policy,
+                num_workers=num_workers, pin_memory=True,
+            )
+            puzzle_optimizer = torch.optim.AdamW(policy_model.parameters(), lr=learning_rate)
+
+            print(f"\n── Phase 2b: puzzle fine-tune — {puzzle_epochs} epochs, lr={learning_rate}")
+            phase2b_start = time.time()
+            for epoch in range(puzzle_epochs):
+                epoch_num = epoch + 1
+                print(f"  [epoch {epoch_num}/{puzzle_epochs}] starting...")
+                avg_loss, global_step, epoch_secs = _run_epoch_policy_puzzle(
+                    policy_model, puzzle_loader, puzzle_optimizer, device, writer, global_step,
+                    policy_epochs + epoch, pad_id,
+                )
+                epochs_left = puzzle_epochs - epoch_num
+                print(
+                    f"  [epoch {epoch_num}/{puzzle_epochs}]  "
+                    f"loss={avg_loss:.4f}  "
+                    f"epoch_time={_fmt_duration(epoch_secs)}  "
+                    f"eta={_fmt_duration(epoch_secs * epochs_left)}"
+                )
+                _run_policy_test(epoch_num, "test_2b")
+
+            print(f"Phase 2b complete in {_fmt_duration(time.time() - phase2b_start)}")
+            torch.save(policy_model.state_dict(), "policy_model.pt")
+            print("Policy model (puzzle fine-tuned) saved to policy_model.pt")
+        else:
+            print(f"WARNING: --puzzle-data given but {puzzle_train_meta} not found; skipping Phase 2b.")
+
+    return reward_model, policy_model, tokenizer
 
 
 def _build_argparser():
     p = argparse.ArgumentParser(description=train.__doc__)
     p.add_argument("--tokenizer-path", default="data/tokenizer.pt")
     p.add_argument("--stockfish-samples-path", default="data/stockfish_samples.pt")
+    p.add_argument("--outcome-games-path", default="data/games_outcome.pt")
     p.add_argument("--epochs", type=int, default=15)
+    p.add_argument("--policy-epochs", type=int, default=15)
     p.add_argument("--batch-size", type=int, default=1024)
     p.add_argument("--learning-rate", type=float, default=3e-5)
     p.add_argument("--max-seq-len", type=int, default=128)
-    p.add_argument("--log-dir", default="runs/chess_reward_model")
+    p.add_argument("--log-dir", default="runs/chess_models")
     p.add_argument("--num-workers", type=int, default=8)
+    p.add_argument("--puzzle-data", default=None, dest="puzzle_data_dir",
+        help="Directory containing puzzle_tokens.bin / puzzle_lengths.bin / puzzle_meta.pt")
+    p.add_argument("--puzzle-epochs", type=int, default=5, dest="puzzle_epochs",
+        help="Number of fine-tuning epochs on puzzle sequences in Phase 2b (default 5)")
     return p
 
 
@@ -668,10 +1079,14 @@ if __name__ == "__main__":
     train(
         tokenizer_path=args.tokenizer_path,
         stockfish_samples_path=args.stockfish_samples_path,
+        outcome_games_path=args.outcome_games_path,
         epochs=args.epochs,
+        policy_epochs=args.policy_epochs,
         batch_size=args.batch_size,
         learning_rate=args.learning_rate,
         max_seq_len=args.max_seq_len,
         log_dir=args.log_dir,
         num_workers=args.num_workers,
+        puzzle_data_dir=args.puzzle_data_dir,
+        puzzle_epochs=args.puzzle_epochs,
     )

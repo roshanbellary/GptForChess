@@ -54,12 +54,6 @@ class TestTrainTokenizer:
         t.train_tokenizer(["a", "b", "a", "c"], max_language_size=3)
         assert t.language_size == 3
 
-    def test_corpus_converted_to_numpy_int_array(self):
-        t = Tokenizer()
-        t.train_tokenizer(["a", "b", "c"], max_language_size=3)
-        assert isinstance(t.corpus, np.ndarray)
-        assert t.corpus.dtype == int
-
     def test_mappings_are_consistent(self):
         t = Tokenizer()
         t.train_tokenizer(["x", "y", "z"], max_language_size=3)

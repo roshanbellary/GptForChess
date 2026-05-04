@@ -111,7 +111,7 @@ class TestBuildTokenizer:
     def test_can_encode_common_moves(self):
         games = self._games_from_csv()
         tokenizer = build_tokenizer_from_games(games)
-        for move in ["e4", "d4", "Nf3", "e5"]:
+        for move in ["e2e4", "d2d4", "g1f3", "e7e5"]:
             assert move in tokenizer.symbol_to_token
 
 
@@ -173,7 +173,7 @@ class TestParallelSampleGeneration:
             shared_tokenizer,
             num_workers=4,
             engine_path=None,  # material_eval fallback, no Stockfish needed
-            max_positions_per_game=5,
+            sample_rate=0.5,
         )
         assert len(samples) > 0, "parallel pool produced no samples"
         for token_ids, score in samples:
@@ -188,14 +188,14 @@ class TestParallelSampleGeneration:
             shared_games,
             shared_tokenizer,
             eval_fn=material_eval,
-            max_positions_per_game=5,
+            sample_rate=0.5,
         )
         parallel = generate_samples_stockfish_parallel(
             shared_games,
             shared_tokenizer,
             num_workers=4,
             engine_path=None,
-            max_positions_per_game=5,
+            sample_rate=0.5,
         )
         assert _canonicalize(serial_ds.samples) == _canonicalize(parallel)
 
@@ -203,11 +203,11 @@ class TestParallelSampleGeneration:
         """Different worker counts must produce the same sample set."""
         s1 = generate_samples_stockfish_parallel(
             shared_games, shared_tokenizer,
-            num_workers=1, engine_path=None, max_positions_per_game=5,
+            num_workers=1, engine_path=None, sample_rate=0.5,
         )
         s8 = generate_samples_stockfish_parallel(
             shared_games, shared_tokenizer,
-            num_workers=8, engine_path=None, max_positions_per_game=5,
+            num_workers=8, engine_path=None, sample_rate=0.5,
         )
         assert _canonicalize(s1) == _canonicalize(s8)
 
@@ -222,7 +222,7 @@ class TestParallelSampleGeneration:
             shared_tokenizer,
             num_workers=4,
             stockfish_depth=4,  # shallow for test speed
-            max_positions_per_game=3,
+            sample_rate=0.15,
         )
         assert len(samples) > 0
         for token_ids, score in samples:
@@ -250,7 +250,7 @@ class TestParallelSampleGeneration:
         t0 = time.time()
         _ = generate_samples_stockfish_parallel(
             games, shared_tokenizer,
-            num_workers=1, stockfish_depth=12, max_positions_per_game=3,
+            num_workers=1, stockfish_depth=12, sample_rate=0.15,
             chunksize=2, progress_every=0,
         )
         serial_time = time.time() - t0
@@ -258,7 +258,7 @@ class TestParallelSampleGeneration:
         t0 = time.time()
         _ = generate_samples_stockfish_parallel(
             games, shared_tokenizer,
-            num_workers=4, stockfish_depth=12, max_positions_per_game=3,
+            num_workers=4, stockfish_depth=12, sample_rate=0.15,
             chunksize=2, progress_every=0,
         )
         parallel_time = time.time() - t0
