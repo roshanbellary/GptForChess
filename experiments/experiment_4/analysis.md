@@ -185,7 +185,7 @@ The cost of the puzzle phase: **−14 points top-1 accuracy on game play, +2.7 p
 ### Play w/ Model
 
 Playing with model purely through policy revealed amazing results. 
-Model was able to play extremely well for starting positions and midgame. Throughout most of smart game, it was able to dominate positions. However for endgame, it gave up pieces too easily losing its lead thus allowing for checkmate. Interestingly enough,
+Model was able to play extremely well for starting positions and midgame. Throughout most of beginning to mid game, it was able to dominate positions. However for endgame, it gave up pieces too easily losing its lead thus allowing for checkmate. Interestingly enough,
 reward model was also not able to catch these blunders.
 
 ---
