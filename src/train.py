@@ -905,53 +905,57 @@ def train(
         print(f"Puzzle test set: {len(puzzle_test_ds):,} sequences loaded")
 
     # ── Phase 1: reward model ────────────────────────────────────────────────
-    sf_meta = out_dir / "stockfish_meta.pt"
-    if sf_meta.exists():
-        print(f"Loading Stockfish samples from memmap ({out_dir}/stockfish_*)...")
-        sf_ds = ChessPositionDataset.from_memmap(out_dir, "stockfish", tokenizer)
-        sf_collate = collate_fn_memmap
-    else:
-        print(f"Loading Stockfish samples from {stockfish_samples_path}...")
-        sf_ds = ChessPositionDataset.from_file(stockfish_samples_path, tokenizer)
-        sf_collate = collate_fn
-    print(f"Reward dataset: {len(sf_ds):,} positions")
-
-    sf_loader = DataLoader(
-        sf_ds, batch_size=batch_size, shuffle=True, collate_fn=sf_collate,
-        num_workers=num_workers, pin_memory=True,
-    )
-
-    reward_model = ChessRewardModel(vocab_size=vocab_size, max_seq_len=max_seq_len).to(device)
-    reward_optimizer = torch.optim.AdamW(reward_model.parameters(), lr=learning_rate)
     global_step = 0
+    reward_model = None
+    if Path("reward_model.pt").exists():
+        print("\n── Phase 1: reward_model.pt already exists, skipping reward training")
+    else:
+        sf_meta = out_dir / "stockfish_meta.pt"
+        if sf_meta.exists():
+            print(f"Loading Stockfish samples from memmap ({out_dir}/stockfish_*)...")
+            sf_ds = ChessPositionDataset.from_memmap(out_dir, "stockfish", tokenizer)
+            sf_collate = collate_fn_memmap
+        else:
+            print(f"Loading Stockfish samples from {stockfish_samples_path}...")
+            sf_ds = ChessPositionDataset.from_file(stockfish_samples_path, tokenizer)
+            sf_collate = collate_fn
+        print(f"Reward dataset: {len(sf_ds):,} positions")
 
-    print(f"\n── Phase 1: reward model — {epochs} epochs, lr={learning_rate}")
-    phase1_start = time.time()
-    for epoch in range(epochs):
-        epoch_num = epoch + 1
-        print(f"  [epoch {epoch_num}/{epochs}] starting...")
-        avg_loss, global_step, epoch_secs = _run_epoch_reward(
-            reward_model, sf_loader, reward_optimizer, device, writer, global_step, epoch
+        sf_loader = DataLoader(
+            sf_ds, batch_size=batch_size, shuffle=True, collate_fn=sf_collate,
+            num_workers=num_workers, pin_memory=True,
         )
-        epochs_left = epochs - epoch_num
-        print(
-            f"  [epoch {epoch_num}/{epochs}]  "
-            f"loss={avg_loss:.4f}  "
-            f"epoch_time={_fmt_duration(epoch_secs)}  "
-            f"eta={_fmt_duration(epoch_secs * epochs_left)}"
-        )
-        if reward_test_loader is not None:
-            m = eval_reward(reward_model, reward_test_loader, device)
-            writer.add_scalar("test/reward_mse", m["mse"], epoch_num)
-            writer.add_scalar("test/reward_mae", m["mae"], epoch_num)
-            writer.add_scalar("test/reward_pearson_r", m["pearson_r"], epoch_num)
-            print(
-                f"  [test]  mse={m['mse']:.4f}  mae={m['mae']:.4f}  r={m['pearson_r']:.4f}"
+
+        reward_model = ChessRewardModel(vocab_size=vocab_size, max_seq_len=max_seq_len).to(device)
+        reward_optimizer = torch.optim.AdamW(reward_model.parameters(), lr=learning_rate)
+
+        print(f"\n── Phase 1: reward model — {epochs} epochs, lr={learning_rate}")
+        phase1_start = time.time()
+        for epoch in range(epochs):
+            epoch_num = epoch + 1
+            print(f"  [epoch {epoch_num}/{epochs}] starting...")
+            avg_loss, global_step, epoch_secs = _run_epoch_reward(
+                reward_model, sf_loader, reward_optimizer, device, writer, global_step, epoch
             )
+            epochs_left = epochs - epoch_num
+            print(
+                f"  [epoch {epoch_num}/{epochs}]  "
+                f"loss={avg_loss:.4f}  "
+                f"epoch_time={_fmt_duration(epoch_secs)}  "
+                f"eta={_fmt_duration(epoch_secs * epochs_left)}"
+            )
+            if reward_test_loader is not None:
+                m = eval_reward(reward_model, reward_test_loader, device)
+                writer.add_scalar("test/reward_mse", m["mse"], epoch_num)
+                writer.add_scalar("test/reward_mae", m["mae"], epoch_num)
+                writer.add_scalar("test/reward_pearson_r", m["pearson_r"], epoch_num)
+                print(
+                    f"  [test]  mse={m['mse']:.4f}  mae={m['mae']:.4f}  r={m['pearson_r']:.4f}"
+                )
 
-    print(f"Phase 1 complete in {_fmt_duration(time.time() - phase1_start)}")
-    torch.save(reward_model.state_dict(), "reward_model.pt")
-    print("Reward model saved to reward_model.pt")
+        print(f"Phase 1 complete in {_fmt_duration(time.time() - phase1_start)}")
+        torch.save(reward_model.state_dict(), "reward_model.pt")
+        print("Reward model saved to reward_model.pt")
 
     # ── Phase 2a: policy model on game sequences ─────────────────────────────
     policy_data_dir = policy_data_dir_early  # already computed above
