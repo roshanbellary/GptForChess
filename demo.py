@@ -2,11 +2,15 @@
 """Pygame chess demo — drag pieces to play against GptForChess.
 
 Run from repo root:
-    PYTHONPATH=src poetry run python demo.py
+    PYTHONPATH=src poetry run python demo.py \
+        --policy-model model/policy_model.pt \
+        --reward-model model/reward_model.pt \
+        --tokenizer data/tokenizer.pt
 """
 import sys
 import os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'src'))
+import argparse
 import threading
 import chess
 import torch
@@ -210,9 +214,26 @@ def promote_dialog(surf, label_font, color: chess.Color) -> chess.PieceType:
     return chess.QUEEN
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description='GptForChess pygame demo')
+    parser.add_argument('--policy-model', type=str, default='model/policy_model.pt',
+                        help='Path to ChessPolicyModel state_dict (used to choose AI moves)')
+    parser.add_argument('--reward-model', type=str, default='model/reward_model.pt',
+                        help='Path to ChessRewardModel state_dict (used for the eval bar)')
+    parser.add_argument('--tokenizer', type=str, default='data/tokenizer.pt',
+                        help='Path to the shared Tokenizer object')
+    parser.add_argument('--device', type=str, default='cpu',
+                        help='Torch device for inference (cpu / cuda / mps)')
+    return parser.parse_args()
+
+
 def main():
-    from model import ChessRewardModel, RewardModelInference
-    from minimax import MinimaxSearch
+    from model import (
+        ChessRewardModel, ChessPolicyModel,
+        RewardModelInference, PolicyModelInference,
+    )
+
+    args = parse_args()
 
     pygame.init()
     surf = pygame.display.set_mode((W, H))
@@ -223,16 +244,25 @@ def main():
 
     # loading screen
     surf.fill(BG)
-    loading = label_font.render('Loading model...', True, TEXT_FG)
+    loading = label_font.render('Loading models...', True, TEXT_FG)
     surf.blit(loading, loading.get_rect(center=(W // 2, H // 2)))
     pygame.display.flip()
 
-    tokenizer = torch.load('data/tokenizer.pt', weights_only=False)
-    model = ChessRewardModel(vocab_size=tokenizer.language_size)
-    model.load_state_dict(torch.load('model/reward_model_v2.pt', map_location='cpu', weights_only=False))
-    model.eval()
-    reward_fn = RewardModelInference(model, tokenizer, device='cpu')
-    searcher  = MinimaxSearch(reward_fn=reward_fn, depth=3, top_n=5)
+    tokenizer = torch.load(args.tokenizer, weights_only=False)
+
+    reward_model = ChessRewardModel(vocab_size=tokenizer.language_size)
+    reward_model.load_state_dict(
+        torch.load(args.reward_model, map_location=args.device, weights_only=False)
+    )
+    reward_model.eval()
+    reward_fn = RewardModelInference(reward_model, tokenizer, device=args.device)
+
+    policy_model = ChessPolicyModel(vocab_size=tokenizer.language_size)
+    policy_model.load_state_dict(
+        torch.load(args.policy_model, map_location=args.device, weights_only=False)
+    )
+    policy_model.eval()
+    policy_fn = PolicyModelInference(policy_model, tokenizer, device=args.device)
 
     board        = chess.Board()
 
@@ -275,8 +305,8 @@ def main():
     clock = pygame.time.Clock()
 
     def run_ai():
-        move = searcher.search(board)
-        ai_result[0] = move
+        move_uci = policy_fn(board)
+        ai_result[0] = chess.Move.from_uci(move_uci)
 
     # if human plays black, AI goes first
     if player_color == chess.BLACK:

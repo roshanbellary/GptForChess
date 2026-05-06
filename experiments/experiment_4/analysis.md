@@ -99,42 +99,118 @@ arch -arm64 poetry run python src/benchmark.py \
 
 ---
 
-## What Was Built (No Training Run Yet)
+## Workflow
 
-The expected workflow on the 4090:
 ```bash
-# 1. Build puzzle data + test sets (run once)
+# 1. Build datasets + test sets (one-time)
 python src/build_datasets.py \
     --min-puzzle-popularity 75 \
     --min-puzzle-plays 5000
 
 # 2. Train: Phase 1 (reward) → Phase 2a (policy on games) → Phase 2b (puzzle fine-tune)
 python src/train.py \
-    --policy-epochs 15 \
+    --policy-epochs 12 \
     --puzzle-data data/ \
     --puzzle-epochs 5
 
-# 3. Benchmark after training
+# 3. Benchmark
 python src/benchmark.py
 ```
 
 ---
 
-## Expected Outcomes and Baselines
+## Results
 
-Based on Experiment 3's reward model MSE of 0.08 (train), I expect:
-- **Reward test MSE**: ~0.10–0.13 (test set will be higher than train; this gives the true number)
-- **Policy top-1 accuracy**: unknown baseline — this is the first time we measure it
-- **Puzzle first-move solve rate**: 30–40% would be strong for a model this size; random baseline is ~0.05% (1/1968 moves)
+### Reward Model
 
-The critical comparison after training: does puzzle augmentation improve first-move solve rate relative to a baseline trained on game sequences only? If the solve rate is above ~25%, tactical augmentation is working. If it's below 15%, the puzzle sequences are too short to provide meaningful context to the model.
+The reward model was trained at the larger architecture (d_model=768, 8 layers, dim_ff=3072, ~58M params) on ~17M Stockfish-labeled positions. Counterintuitively, **the absolute MSE/MAE values are higher than Experiment 3's smaller model** — at first glance this looks like a regression, but the more diagnostic finding is the relationship between train and test loss.
+
+**Test MSE was consistently lower than train MSE across all 10 epochs.** That's the opposite of the usual pattern and is a clear signal that the model is **underfitting** rather than overfitting. The model has more capacity to use; the data isn't saturating it. This means the architecture can be pushed further (more parameters, more epochs, or more data) and we should expect performance gains rather than diminishing returns. Pearson r climbed steadily across epochs, confirming the model is still learning the Stockfish→position mapping rather than memorizing it.
+
+![Test Reward MSE](test_reward_mse.png)
+![Test Reward MAE](test_reward_mae.png)
+![Test Reward Pearson r](test_reward_pearson.png)
+
+**Takeaway**: capacity-bound, not data-bound. A future experiment can scale d_model from 768 → 1024 (the "Mid upscale" config evaluated earlier) with confidence the gains will materialize.
+
+### Policy Model — Phase 2a (game sequences)
+
+Phase 2a was unambiguously successful. Cross-entropy loss descended cleanly from ~6.0 (uniform-distribution baseline over 1968 UCI moves is ~7.6) down to **~1.5 by epoch 12**. Held-out test metrics at the end of Phase 2a:
+
+| Metric | Phase 2a final |
+|---|---|
+| Test loss | 1.386 |
+| Test perplexity | 4.00 |
+| Test top-1 accuracy | **65.4%** |
+| Test top-5 accuracy | **81.9%** |
+
+A perplexity of 4.0 on the policy model means at every position in a held-out game, the model's distribution is as concentrated as if it were uniformly choosing among only ~4 moves out of 1968 possible. Top-1 of 65% means in roughly two-thirds of positions, the model's single best guess matches the move actually played by an 1800+ Elo player — that's strong for this scale.
+
+![Policy Loss](test_policy_loss.png)
+![Policy Perplexity](test_policy_perplexity.png)
+![Policy Top-1 Accuracy](test_policy_top1_acc.png)
+
+This Phase 2a checkpoint (`policy_model_phase2a.pt`) is the strong baseline going forward. The training loop now saves it explicitly so it survives Phase 2b regardless of what happens.
+
+### Policy Model — Phase 2b (puzzle fine-tuning, what went wrong)
+
+Phase 2b was where the experiment broke down, and the root cause was a misunderstanding of the puzzle data format.
+
+I had assumed the `FEN` field in each Lichess puzzle could be treated as a sequence of setup moves — i.e., that the FEN was equivalent to "play this sequence of moves from the starting position to reach the puzzle." Under that assumption, the natural integration was: tokenize the FEN-implied move history alongside the puzzle solution moves, feed everything into the existing transformer, and let the model learn from the combined sequence.
+
+That assumption was wrong. **A FEN is a snapshot of board state at one moment**, not a recipe for getting there. It encodes piece positions, side-to-move, castling rights, and en passant availability — but no information about the move sequence that produced the position. There may be many move sequences that lead to the same FEN, and the FEN itself can't be reconstructed from a sequence of moves without replaying them.
+
+The consequence in the data pipeline (`_process_puzzle()` in `src/build_datasets.py`): the FEN was used only to *validate* that puzzle moves were legal during dataset construction, then **thrown away**. The token sequence saved to `puzzle_*.bin` contained only `[CLS, S, m1, opp1, m2, ...]` — the puzzle's local move sequence with no representation of the underlying position. The model was being fine-tuned on bare move sequences torn out of context, with no way to know what board state those moves were responding to.
+
+The benchmark numbers reflect the damage:
+
+| Metric | After Phase 2a | After Phase 2b | Δ |
+|---|---|---|---|
+| Policy loss | 1.386 | 2.986 | +1.6 (much worse) |
+| Policy perplexity | 4.00 | 19.81 | **5× worse** |
+| Policy top-1 (games) | 65.4% | 51.3% | **−14.1 pp** |
+| Policy top-5 (games) | 81.9% | 61.8% | **−20.1 pp** |
+| Puzzle first_move | 0.1% | 3.6% | +3.5 pp |
+| Puzzle all_moves | 66.9% | 69.6% | +2.7 pp |
+
+![Puzzle First-Move Solve Rate](test_puzzle_first_move.png)
+![Puzzle All-Moves Solve Rate](test_puzzle_all_moves.png)
+![Final Benchmark Output](policy_benchmark.png)
+
+The first-move solve rate of **3.6%** (only ~70× better than random over 1968 moves) is the fingerprint of the missing FEN context: the model is being asked "predict m1 given just `[CLS, S]`" without any way to see what position S was played in. It can't possibly know the right answer because the position itself is hidden from it. The all-moves rate is high (69.6%) only because by the time the model is predicting m2, m3, etc. it has enough local move-sequence context to pattern-match — which is what the games-only Phase 2a model was already doing (66.9% before fine-tuning).
+
+The cost of the puzzle phase: **−14 points top-1 accuracy on game play, +2.7 points on puzzle solve rate.** A clear net loss. The puzzle data couldn't deliver the tactical signal it nominally contains because the architectural prerequisite (some way to encode position state) was missing.
+
+
+### Play w/ Model
+
+Playing with model purely through policy revealed amazing results. 
+Model was able to play extremely well for starting positions and midgame. Throughout most of smart game, it was able to dominate positions. However for endgame, it gave up pieces too easily losing its lead thus allowing for checkmate. Interestingly enough,
+reward model was also not able to catch these blunders.
 
 ---
 
-## Avenues for Improvement (Pre-Training Observations)
+## Lessons Learned
 
-**Puzzle context problem**: The model has no FEN encoder. It sees `[CLS, setup_move, solver_move1, ...]` with no knowledge of the board state before the puzzle begins. This limits how much it can generalize — it's learning tactical move patterns ("if opponent plays X, respond Y") rather than board state evaluation. A future improvement is to prepend a sequence of reconstructed moves from the full game (using the GameId field in the puzzle data) so the model has board context before the puzzle position. This would require fetching game histories from Lichess.
+1. **The Phase 2a checkpoint must be preserved separately.** The original training loop overwrote `policy_model.pt` at the end of Phase 2b, destroying the strong baseline. The code now saves `policy_model_phase2a.pt` as a permanent artifact at the end of Phase 2a, before Phase 2b runs.
+2. **Puzzle data without position encoding is misleading supervision.** The puzzle dataset *looks* like it should give clean tactical signal — but the signal depends on the model knowing the board state, which the current architecture can't represent. Cross-entropy loss going down on puzzle training data is not the same as the model learning to solve puzzles; it can drive down loss by drifting toward middlegame-tactical patterns at the expense of opening/endgame play.
+3. **Test MSE < train MSE on the reward model is a "do more" signal, not a "we're done" signal.** Underfitting is the green light to scale up.
 
-**Rating stratification**: The 1.5M quality-filtered puzzles are heavily skewed toward 1200–1800 Elo difficulty. The model will be overfit to intermediate-level tactics and may miss grandmaster-level combinational patterns. Future: sample uniformly across rating bands to cover beginner through master tactics.
+---
 
-**Puzzle solve rate decomposition**: The benchmark currently reports an aggregate solve rate. More useful would be solve rate broken down by puzzle theme (mate, fork, pin, etc.) and by rating band. This would reveal exactly which tactical patterns the model has and hasn't learned.
+## Plan: Experiment 5 — CNN board encoder
+
+The architectural fix for the puzzle problem is to add a small CNN that takes board state as input and produces a `d_model`-dim embedding, which is then injected into the transformer alongside the move tokens. Roughly:
+
+- Encode the FEN as a stack of 8×8 piece planes (12 piece-type planes + side-to-move + castling rights = ~14 channels)
+- Run a 3-layer ConvNet over those planes → single context vector
+- Inject the vector into the token stream, likely **replacing the CLS token at position 0** (CLS is currently a learned constant; the CNN output makes it a position-dependent, content-rich context vector). Alternative integrations under consideration: prepending as a separate context token, or adding to every token's embedding.
+
+The two essential properties this architecture will have:
+
+1. **Puzzles get processed correctly**: the FEN snapshot becomes an input to the model, not metadata thrown away during preprocessing. Predicting `m1` from `[board_ctx, S]` becomes well-defined because the model can finally see the position.
+2. **Game inference also benefits**: at every move, the board state is recomputed (cheap with `python-chess`) and re-encoded, so the embedding updates as the game evolves. This relieves the transformer of having to *track* board state implicitly through 60+ moves of attention — that capacity goes back into "what move is best given this board?"
+
+Training will fine-tune from `policy_model_phase2a.pt` with the new CNN initialized randomly, using a small LR for the transformer and a normal LR for the CNN so existing learned patterns aren't destroyed during co-adaptation.
+
+Expected target: puzzle first-move solve rate jumps from 3.6% to 30%+, and policy top-1 on games at minimum holds at Phase 2a's 65.4% (and likely improves slightly because the model no longer has to learn implicit board-state tracking).
