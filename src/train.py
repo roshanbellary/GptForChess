@@ -854,6 +854,7 @@ def train(
     num_workers,
     puzzle_data_dir=None,
     puzzle_epochs=5,
+    puzzle_lr=None,
 ):
     """Train the reward model then the policy model.
 
@@ -1016,8 +1017,12 @@ def train(
         _run_policy_test(epoch_num, "test_2a")
 
     print(f"Phase 2a complete in {_fmt_duration(time.time() - phase2a_start)}")
+    # Save the games-only checkpoint to a stable name so Phase 2b can't destroy it
+    # via catastrophic forgetting on puzzle data. This file is the authoritative
+    # baseline for general game-sequence performance.
+    torch.save(policy_model.state_dict(), "policy_model_phase2a.pt")
     torch.save(policy_model.state_dict(), "policy_model.pt")
-    print("Policy model saved to policy_model.pt")
+    print("Policy model saved to policy_model.pt and policy_model_phase2a.pt")
 
     # ── Phase 2b: fine-tune policy model on puzzle sequences ─────────────────
     if puzzle_data_dir is not None and puzzle_epochs > 0:
@@ -1030,7 +1035,12 @@ def train(
                 puzzle_ds, batch_size=batch_size, shuffle=True, collate_fn=collate_fn_policy,
                 num_workers=num_workers, pin_memory=True,
             )
-            puzzle_optimizer = torch.optim.AdamW(policy_model.parameters(), lr=learning_rate)
+            # Puzzle phase uses a much smaller LR than Phase 2a by default.
+            # Phase 2b is a distribution shift (mid-game tactical only) and
+            # full LR causes catastrophic forgetting of opening/endgame play.
+            effective_puzzle_lr = puzzle_lr if puzzle_lr is not None else learning_rate * 0.1
+            print(f"  Phase 2b LR = {effective_puzzle_lr:.1e}  (Phase 2a LR was {learning_rate:.1e})")
+            puzzle_optimizer = torch.optim.AdamW(policy_model.parameters(), lr=effective_puzzle_lr)
 
             print(f"\n── Phase 2b: puzzle fine-tune — {puzzle_epochs} epochs, lr={learning_rate}")
             phase2b_start = time.time()
@@ -1073,8 +1083,13 @@ def _build_argparser():
     p.add_argument("--num-workers", type=int, default=8)
     p.add_argument("--puzzle-data", default=None, dest="puzzle_data_dir",
         help="Directory containing puzzle_tokens.bin / puzzle_lengths.bin / puzzle_meta.pt")
-    p.add_argument("--puzzle-epochs", type=int, default=5, dest="puzzle_epochs",
-        help="Number of fine-tuning epochs on puzzle sequences in Phase 2b (default 5)")
+    p.add_argument("--puzzle-epochs", type=int, default=2, dest="puzzle_epochs",
+        help="Number of fine-tuning epochs on puzzle sequences in Phase 2b (default 2). "
+             "Note: Phase 2b on heavily middlegame-tactical data causes catastrophic "
+             "forgetting of opening/endgame play. Default reduced from 5 to 2.")
+    p.add_argument("--puzzle-lr", type=float, default=None, dest="puzzle_lr",
+        help="LR for Phase 2b puzzle fine-tuning. If unset, defaults to 0.1 * --learning-rate "
+             "to preserve Phase 2a's general game-sequence performance.")
     return p
 
 
@@ -1093,4 +1108,5 @@ if __name__ == "__main__":
         num_workers=args.num_workers,
         puzzle_data_dir=args.puzzle_data_dir,
         puzzle_epochs=args.puzzle_epochs,
+        puzzle_lr=args.puzzle_lr,
     )
