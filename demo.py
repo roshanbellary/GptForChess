@@ -1,10 +1,13 @@
 #!/usr/bin/env python3
 """Pygame chess demo — drag pieces to play against GptForChess.
 
-Run from repo root:
+Defaults to the canonical Experiment 4 checkpoints. Run from repo root with no
+arguments to use them, or override any path explicitly:
+
+    PYTHONPATH=src poetry run python demo.py
     PYTHONPATH=src poetry run python demo.py \
-        --policy-model model/policy_model.pt \
-        --reward-model model/reward_model.pt \
+        --policy-model experiments/experiment_4/policy_model_phase2a.pt \
+        --reward-model experiments/experiment_4/reward_model.pt \
         --tokenizer data/tokenizer.pt
 """
 import sys
@@ -216,10 +219,15 @@ def promote_dialog(surf, label_font, color: chess.Color) -> chess.PieceType:
 
 def parse_args():
     parser = argparse.ArgumentParser(description='GptForChess pygame demo')
-    parser.add_argument('--policy-model', type=str, default='model/policy_model.pt',
-                        help='Path to ChessPolicyModel state_dict (used to choose AI moves)')
-    parser.add_argument('--reward-model', type=str, default='model/reward_model.pt',
-                        help='Path to ChessRewardModel state_dict (used for the eval bar)')
+    parser.add_argument('--policy-model', type=str,
+                        default='experiments/experiment_4/policy_model_phase2a.pt',
+                        help='Path to ChessPolicyModel state_dict (used to choose AI moves). '
+                             'Defaults to the Phase 2a checkpoint from Experiment 4 — the strong '
+                             'games-only baseline (top-1 65.4%, top-5 81.9%).')
+    parser.add_argument('--reward-model', type=str,
+                        default='experiments/experiment_4/reward_model.pt',
+                        help='Path to ChessRewardModel state_dict (used for the eval bar). '
+                             'Defaults to the Experiment 4 reward model.')
     parser.add_argument('--tokenizer', type=str, default='data/tokenizer.pt',
                         help='Path to the shared Tokenizer object')
     parser.add_argument('--device', type=str, default='cpu',
