@@ -302,15 +302,18 @@ def puzzle_tokenizer():
 class TestProcessPuzzle:
     def test_valid_puzzle_returns_sequence(self, puzzle_tokenizer):
         cls_id = puzzle_tokenizer.symbol_to_token[CLS_TOKEN]
-        seq = _process_puzzle(SYNTHETIC_PUZZLES[0], puzzle_tokenizer.symbol_to_token, cls_id)
-        assert seq is not None
+        result = _process_puzzle(SYNTHETIC_PUZZLES[0], puzzle_tokenizer.symbol_to_token, cls_id)
+        assert result is not None
+        seq, fen = result
         assert seq[0] == cls_id
         assert len(seq) == 5  # CLS + setup + 3 solver moves
+        assert fen == SYNTHETIC_PUZZLES[0]["FEN"]
 
     def test_minimum_length_sequence(self, puzzle_tokenizer):
         cls_id = puzzle_tokenizer.symbol_to_token[CLS_TOKEN]
-        seq = _process_puzzle(SYNTHETIC_PUZZLES[1], puzzle_tokenizer.symbol_to_token, cls_id)
-        assert seq is not None
+        result = _process_puzzle(SYNTHETIC_PUZZLES[1], puzzle_tokenizer.symbol_to_token, cls_id)
+        assert result is not None
+        seq, _ = result
         assert len(seq) == 3  # CLS + setup + 1 solver move
 
     def test_invalid_puzzles_return_none(self, puzzle_tokenizer):
@@ -321,8 +324,9 @@ class TestProcessPuzzle:
 
     def test_all_tokens_are_known_moves(self, puzzle_tokenizer):
         cls_id = puzzle_tokenizer.symbol_to_token[CLS_TOKEN]
-        seq = _process_puzzle(SYNTHETIC_PUZZLES[0], puzzle_tokenizer.symbol_to_token, cls_id)
-        assert seq is not None
+        result = _process_puzzle(SYNTHETIC_PUZZLES[0], puzzle_tokenizer.symbol_to_token, cls_id)
+        assert result is not None
+        seq, _ = result
         for tok in seq[1:]:
             assert tok in puzzle_tokenizer.token_to_symbol
 
@@ -363,7 +367,11 @@ class TestStage5Puzzles:
 
         ds = ChessPolicyDataset.from_memmap(tmp_path, puzzle_tokenizer, name="puzzle")
         assert len(ds) == 1
-        assert ds[0][0].item() == puzzle_tokenizer.symbol_to_token[CLS_TOKEN]
+        tokens, planes, _, _ = ds[0]
+        assert tokens[0].item() == puzzle_tokenizer.symbol_to_token[CLS_TOKEN]
+        assert planes.shape == (19, 8, 8)
+        # FEN file should have been written and reloaded
+        assert (tmp_path / "puzzle_fens.bin").exists()
 
     def test_stage5_skips_if_meta_exists(self, tmp_path, capsys, puzzle_tokenizer):
         # Skip requires BOTH puzzle_meta.pt AND puzzle_test_meta.pt to exist
@@ -418,7 +426,8 @@ class TestChessPolicyDatasetFromMemmapGeneralized:
         _save_policy_memmap(seqs, tmp_path, "puzzle", max_seq_len=10)
         ds = ChessPolicyDataset.from_memmap(tmp_path, tokenizer, name="puzzle")
         assert len(ds) == 2
-        assert ds[0][0].item() == cls_id
+        tokens, _, _, _ = ds[0]
+        assert tokens[0].item() == cls_id
 
 
 class TestTrainTestDisjointness:
@@ -441,7 +450,7 @@ class TestTrainTestDisjointness:
         assert len(ds) == 3  # 5 total - 2 held out
 
         # Remaining sequences must come from indices 0, 2, 4 — i.e. second tokens 1, 3, 5.
-        second_tokens = sorted(ds[i][1].item() for i in range(len(ds)))
+        second_tokens = sorted(ds[i][0][1].item() for i in range(len(ds)))
         assert second_tokens == [cls_id + 1, cls_id + 3, cls_id + 5]
 
     def test_test_memmap_does_not_self_exclude(self, tmp_path):

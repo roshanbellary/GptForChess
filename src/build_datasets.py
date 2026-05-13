@@ -234,14 +234,19 @@ def _generate_policy_sequences(games, tokenizer, max_seq_len: int = 128) -> list
 
 
 def _save_policy_memmap(
-    sequences: list[list[int]], out_dir: Path, name: str, max_seq_len: int = 128
+    sequences: list[list[int]], out_dir: Path, name: str, max_seq_len: int = 128,
+    fens: list[str] | None = None, fen_len: int = 100,
 ) -> None:
     """Save policy sequences as memory-mapped arrays (no labels).
 
     Produces:
       {name}_tokens.bin   — (N, max_len) int32, zero-padded
       {name}_lengths.bin  — (N,) int32, actual sequence length per sample
-      {name}_meta.pt      — dict with 'n' and 'max_len'
+      {name}_meta.pt      — dict with 'n', 'max_len', and (if fens given) 'fen_len'
+
+    If `fens` is provided, also writes {name}_fens.bin — (N, fen_len) uint8
+    holding zero-padded ASCII FEN strings, one per sample. Used by the
+    CNN-conditioned policy training to reconstruct each sample's starting board.
     """
     n = len(sequences)
     max_len = min(max(len(s) for s in sequences), max_seq_len)
@@ -258,8 +263,21 @@ def _save_policy_memmap(
 
     tokens.flush()
     lengths.flush()
-    torch.save({"n": n, "max_len": max_len}, out_dir / f"{name}_meta.pt")
-    size_gb = (tokens.nbytes + lengths.nbytes) / 1024 ** 3
+
+    meta = {"n": n, "max_len": max_len}
+    extra_bytes = 0
+    if fens is not None:
+        assert len(fens) == n, f"fen count {len(fens)} mismatch with sequence count {n}"
+        fens_mm = np.memmap(out_dir / f"{name}_fens.bin", dtype=np.uint8, mode="w+", shape=(n, fen_len))
+        for i, fen in enumerate(fens):
+            b = fen.encode("ascii")[:fen_len]
+            fens_mm[i, :len(b)] = list(b)
+        fens_mm.flush()
+        meta["fen_len"] = fen_len
+        extra_bytes = fens_mm.nbytes
+
+    torch.save(meta, out_dir / f"{name}_meta.pt")
+    size_gb = (tokens.nbytes + lengths.nbytes + extra_bytes) / 1024 ** 3
     print(f"  memmap {name} saved ({size_gb:.3f} GB)")
 
 
@@ -267,14 +285,18 @@ def _process_puzzle(
     row: dict,
     tokenizer_symbol_map: dict,
     cls_id: int,
-) -> list[int] | None:
-    """Parse one Lichess puzzle row into a token sequence.
+) -> tuple[list[int], str] | None:
+    """Parse one Lichess puzzle row into a (token_sequence, FEN) pair.
 
     Sequence layout: [CLS, setup_move, solver_move1, opp_response, solver_move2, ...]
 
     The setup move (Moves[0]) is included as context so the model conditions on it
     when predicting the solution. During training the loss on the setup move position
     is masked out — we model P[m_n | S, m_{<n}] where S is the setup move.
+
+    The FEN is the puzzle's starting board position. It is persisted alongside the
+    token sequence so the CNN-conditioned policy training can reconstruct the
+    starting board planes (CNN's input) at __getitem__ time.
 
     Returns None if any move is illegal, unknown to the tokenizer, or the sequence
     has fewer than 3 tokens (CLS + setup + at least one solver move).
@@ -307,7 +329,7 @@ def _process_puzzle(
 
     if len(token_ids) < 3:  # CLS + setup + at least one solver move
         return None
-    return token_ids
+    return token_ids, fen
 
 
 def stage3_stockfish_samples(args: argparse.Namespace) -> None:
@@ -459,7 +481,9 @@ def stage5_puzzle_samples(args: argparse.Namespace, tokenizer, out_dir: Path) ->
     cls_id = tokenizer.symbol_to_token[CLS_TOKEN]
     sym_map = tokenizer.symbol_to_token
     test_seqs: list[list[int]] = []
+    test_fens: list[str] = []
     train_seqs: list[list[int]] = []
+    train_fens: list[str] = []
     skipped = 0
     test_target = args.puzzle_test_size
     train_target = args.puzzle_count
@@ -470,14 +494,17 @@ def stage5_puzzle_samples(args: argparse.Namespace, tokenizer, out_dir: Path) ->
                 continue
             if min_plays is not None and row.get("NbPlays", 0) < min_plays:
                 continue
-            seq = _process_puzzle(row, sym_map, cls_id)
-            if seq is None:
+            result = _process_puzzle(row, sym_map, cls_id)
+            if result is None:
                 skipped += 1
                 continue
+            seq, fen = result
             if len(test_seqs) < test_target:
                 test_seqs.append(seq)
+                test_fens.append(fen)
             else:
                 train_seqs.append(seq)
+                train_fens.append(fen)
             pbar.set_postfix(test=len(test_seqs), train=len(train_seqs), skipped=skipped)
             if train_target is not None and len(train_seqs) >= train_target:
                 break
@@ -488,9 +515,13 @@ def stage5_puzzle_samples(args: argparse.Namespace, tokenizer, out_dir: Path) ->
         f"skipped={skipped:,} invalid."
     )
     if test_seqs and not test_done:
-        _save_policy_memmap(test_seqs, out_dir, "puzzle_test", max_seq_len=args.max_seq_len)
+        _save_policy_memmap(
+            test_seqs, out_dir, "puzzle_test", max_seq_len=args.max_seq_len, fens=test_fens,
+        )
     if train_seqs and not train_done:
-        _save_policy_memmap(train_seqs, out_dir, "puzzle", max_seq_len=args.max_seq_len)
+        _save_policy_memmap(
+            train_seqs, out_dir, "puzzle", max_seq_len=args.max_seq_len, fens=train_fens,
+        )
     elif not train_seqs:
         print("Stage 5: WARNING — no training puzzles collected.")
 
@@ -527,6 +558,10 @@ def main():
         help="Min NbPlays for a puzzle to be included")
     parser.add_argument("--skip-puzzles", action="store_true",
         help="Skip Stage 5 puzzle processing")
+    parser.add_argument("--puzzles-only", action="store_true",
+        help="Only run Stage 5 (puzzle processing). Skips game collection, "
+             "outcome/Stockfish/policy memmaps, and test splits. Requires "
+             "tokenizer.pt to exist (or it will be built from the UCI vocab).")
     parser.add_argument("--puzzle-test-size", type=int, default=100_000, dest="puzzle_test_size",
         help="Number of puzzle sequences held out for the test set (default: 100000)")
     parser.add_argument("--reward-test-size", type=int, default=50_000, dest="reward_test_size",
@@ -537,19 +572,31 @@ def main():
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
 
-    stage1_collect_games(args)
-    stage2_outcome_samples(args)
-    stage3_stockfish_samples(args)
-    stage4_policy_sequences(args)
-
-    tokenizer_path = args.out_dir / "tokenizer.pt"
-    if not args.skip_puzzles and tokenizer_path.exists():
-        tokenizer = torch.load(tokenizer_path, weights_only=False)
+    if args.puzzles_only:
+        print("--puzzles-only: skipping Stages 1-4 and test-split builder.")
+        tokenizer_path = args.out_dir / "tokenizer.pt"
+        if tokenizer_path.exists():
+            tokenizer = torch.load(tokenizer_path, weights_only=False)
+        else:
+            # Tokenizer is just the enumerated UCI vocab — no games needed.
+            print("  tokenizer.pt missing; building from UCI vocab...")
+            tokenizer = build_tokenizer_from_games()
+            torch.save(tokenizer, tokenizer_path)
         stage5_puzzle_samples(args, tokenizer, args.out_dir)
-    elif not args.skip_puzzles:
-        print("Stage 5: skipping — tokenizer.pt not found (run stages 1-2 first).")
+    else:
+        stage1_collect_games(args)
+        stage2_outcome_samples(args)
+        stage3_stockfish_samples(args)
+        stage4_policy_sequences(args)
 
-    stage_build_test_splits(args, args.out_dir)
+        tokenizer_path = args.out_dir / "tokenizer.pt"
+        if not args.skip_puzzles and tokenizer_path.exists():
+            tokenizer = torch.load(tokenizer_path, weights_only=False)
+            stage5_puzzle_samples(args, tokenizer, args.out_dir)
+        elif not args.skip_puzzles:
+            print("Stage 5: skipping — tokenizer.pt not found (run stages 1-2 first).")
+
+        stage_build_test_splits(args, args.out_dir)
 
     print("\nAll stages complete. Artifacts:")
     for name in (
@@ -569,9 +616,11 @@ def main():
         "policy_meta.pt",
         "puzzle_tokens.bin",
         "puzzle_lengths.bin",
+        "puzzle_fens.bin",
         "puzzle_meta.pt",
         "puzzle_test_tokens.bin",
         "puzzle_test_lengths.bin",
+        "puzzle_test_fens.bin",
         "puzzle_test_meta.pt",
         "stockfish_test_tokens.bin",
         "stockfish_test_labels.bin",

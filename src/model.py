@@ -17,6 +17,71 @@ PIECE_VALUES = {
     chess.KING: 0,
 }
 
+BOARD_PLANES = 19
+
+def board_to_planes(board: chess.Board) -> torch.Tensor:
+    """chess.Board -> (19, 8, 8) float tensor."""
+    planes = torch.zeros(BOARD_PLANES, 8, 8, dtype=torch.float32)
+    pieces = [chess.PAWN, chess.KNIGHT, chess.BISHOP, chess.ROOK, chess.QUEEN, chess.KING]
+    colors = [chess.WHITE, chess.BLACK]
+    piece_to_plane = {(piece, color) : 6 * color_num + piece_num  for piece_num, piece in enumerate(pieces) for color_num, color in enumerate(colors)}
+
+    for sq, piece in board.piece_map().items():
+        r, c = chess.square_rank(sq), chess.square_file(sq)
+
+        planes[piece_to_plane[(piece.piece_type, piece.color)], r, c] = 1.0
+    
+    if board.turn == chess.WHITE:
+        planes[12].fill_(1.0)
+    
+    if board.has_kingside_castling_rights(chess.WHITE):  planes[13].fill_(1.0)                   
+    if board.has_queenside_castling_rights(chess.WHITE): planes[14].fill_(1.0)                   
+    if board.has_kingside_castling_rights(chess.BLACK):  planes[15].fill_(1.0)                   
+    if board.has_queenside_castling_rights(chess.BLACK): planes[16].fill_(1.0)                   
+    if board.ep_square is not None:                                                              
+        r, c = chess.square_rank(board.ep_square), chess.square_file(board.ep_square)
+        planes[17, r, c] = 1.0                                                                   
+    planes[18].fill_(min(board.halfmove_clock, 100) / 100.0)
+    
+    return planes
+
+def _group_norm(channels: int, groups: int = 32) -> nn.GroupNorm:
+    return nn.GroupNorm(num_groups=min(groups, channels), num_channels=channels)
+
+
+class ResidualBlock(nn.Module):
+    def __init__(self, channels: int):
+        super().__init__()
+        self.conv1 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
+        self.norm1 = _group_norm(channels)
+        self.conv2 = nn.Conv2d(channels, channels, 3, padding=1, bias=False)
+        self.norm2 = _group_norm(channels)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        h = torch.relu(self.norm1(self.conv1(x)))
+        h = self.norm2(self.conv2(h))
+        return torch.relu(h + x)
+
+
+class BoardCNN(nn.Module):
+    """(B, 19, 8, 8) -> (B, d_model): one context-rich vector per board."""
+    def __init__(self, d_model: int, channels: int = 128, num_blocks: int = 6):
+        super().__init__()
+        self.stem = nn.Sequential(
+            nn.Conv2d(BOARD_PLANES, channels, 3, padding=1, bias=False),
+            _group_norm(channels),
+            nn.ReLU(inplace=True),
+        )
+        self.blocks = nn.Sequential(*[ResidualBlock(channels) for _ in range(num_blocks)])
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.proj = nn.Linear(channels, d_model)
+
+    def forward(self, planes: torch.Tensor) -> torch.Tensor:
+        x = self.stem(planes)
+        x = self.blocks(x)
+        x = self.pool(x).flatten(1)   # (B, channels)
+        return self.proj(x)           # (B, d_model)
+
 
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model: int, max_len: int = 512, dropout: float = 0.1):
@@ -84,10 +149,13 @@ class ChessPolicyModel(nn.Module):
         dim_feedforward: int = 3072,
         max_seq_len: int = 128,
         dropout: float = 0.1,
+        cnn_channels: int = 128,
+        cnn_blocks: int = 6,
     ):
         super().__init__()
         self.vocab_size = vocab_size
         self.token_embedding = nn.Embedding(vocab_size, d_model)
+        self.board_cnn = BoardCNN(d_model, cnn_channels, cnn_blocks)
         self.pos_encoding = PositionalEncoding(d_model, max_seq_len, dropout)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model, nhead, dim_feedforward, dropout, batch_first=True
@@ -98,16 +166,22 @@ class ChessPolicyModel(nn.Module):
     def forward(
         self,
         token_ids: torch.Tensor,
+        board_planes: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """
         Args:
             token_ids: (batch, seq_len) int tensor with CLS as BOS at position 0
+            board_planes: (batch, 19, 8, 8) float tensor of the current board
             attention_mask: (batch, seq_len) bool tensor, True where padded
         Returns:
             (batch, seq_len, vocab_size) raw logits at every position
         """
-        x = self.token_embedding(token_ids)
+        move_emb = self.token_embedding(token_ids)              # (B, T, d)
+        board_emb = self.board_cnn(board_planes).unsqueeze(1)   # (B, 1, d)
+        # Replace position-0 (CLS) with the board summary so the move sequence
+        # is conditioned on the current state without growing the sequence.
+        x = torch.cat([board_emb, move_emb[:, 1:, :]], dim=1)   # (B, T, d)
         x = self.pos_encoding(x)
         seq_len = token_ids.size(1)
         causal_mask = nn.Transformer.generate_square_subsequent_mask(seq_len, device=token_ids.device)
@@ -165,8 +239,9 @@ class PolicyModelInference:
         moves_uci = moves_uci[-(max_seq_len - 1):]
         token_ids = [self.cls_id] + self.tokenizer.encode_moves(moves_uci)
         token_tensor = torch.tensor([token_ids], dtype=torch.long, device=self.device)
+        planes = board_to_planes(board).unsqueeze(0).to(self.device)
 
-        logits = self.model(token_tensor)          # (1, seq_len, vocab_size)
+        logits = self.model(token_tensor, planes)  # (1, seq_len, vocab_size)
         last_logits = logits[0, -1]                # (vocab_size,) — last position has full history
 
         legal_move_ids = [self.tokenizer.symbol_to_token[move.uci()] for move in board.legal_moves]
