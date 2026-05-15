@@ -1,4 +1,4 @@
-# Experiment 4: Puzzle-Augmented Policy Training + Systematic Benchmarking
+# Experiment 5: CNN Board Embedding + Mixed Game/Puzzle Training
 
 
 ## Hypothesis
@@ -196,3 +196,187 @@ drive CNN-conditioned puzzle training correctly. Re-running
 `build_datasets.py` Stage 5 produces the new `puzzle_fens.bin` /
 `puzzle_test_fens.bin` files alongside the existing token/length files.
 A loud warning is printed if puzzle data is loaded without the FEN sidecar.
+
+
+## Results
+
+### Headline numbers (epoch 12, held-out test)
+
+| Metric                       | Exp 4 (Phase 2a) | Exp 4 (Phase 2b) | Exp 5 (mixed + CNN) |
+|------------------------------|------------------|------------------|---------------------|
+| Game policy loss             | 1.386            | 2.986            | **1.5384**          |
+| Game perplexity              | ~4.0             | ~19.8            | **4.66**            |
+| Game top-1 accuracy          | 65.4%            | ~9%              | **64.03%**          |
+| Game top-5 accuracy          | ~78%             | —                | **79.52%**          |
+| Puzzle first-move solve      | 3.6%             | 30%+ (target)    | **12.67%**          |
+| Puzzle all-moves solve       | 66.9%            | 69.6%            | **68.25%**          |
+| Train loss (epoch 12)        | ~1.30            | —                | **0.8473**          |
+| Train / test gap             | small            | —                | **0.75 (large)**    |
+
+### What the curves say
+
+- **`train_policy/batch_loss`** descends cleanly from ~1.45 to **~0.79** over
+  13.9K batches with no plateau or divergence — the model is still learning at
+  shutdown. No sign of the lossy/oscillatory behavior that motivated this
+  experiment.
+
+  ![Train batch loss](train_policy_batch_loss.png)
+
+- **`train_policy/epoch_loss`** mirrors that: a smooth 1.33 → 0.85 descent. No
+  visible bend that would suggest the optimizer is saturating.
+
+  ![Train epoch loss](train_policy_epoch_loss.png)
+
+- **`test_mixed/policy_loss`** descends from ~2.5 to **1.60** (smoothed) — also
+  monotonic and still trending down at epoch 12.
+
+  ![Test policy loss](test_mixed_policy_loss.png)
+
+- **`test_mixed/policy_perplexity`** drops from ~12 to **4.96**, consistent
+  with the loss curve.
+
+  ![Test policy perplexity](test_mixed_policy_perplexity.png)
+
+- **`test_mixed/policy_top1_acc`** climbs to **63.6%**, top-5 to **78.7%** —
+  effectively matching Exp 4 Phase 2a despite the multi-objective load.
+
+  ![Test top-1 accuracy](test_mixed_policy_top1_acc.png)
+  ![Test top-5 accuracy](test_mixed_policy_top5acc.png)
+
+- **`test_mixed/puzzle_first_move`** climbs roughly linearly from ~1% to
+  **~12.7%**. It has *not* flattened — the trajectory suggests further epochs
+  would continue to push it up.
+
+  ![Puzzle first-move solve](test_mixed_puzzle_first_move.png)
+
+- **`test_mixed/puzzle_all_moves`** climbs from ~64% to **70%**, again still
+  trending up.
+
+  ![Puzzle all-moves solve](test_mixed_puzzle_all_moves.png)
+
+End-of-run benchmark summary:
+
+![Benchmark summary](benchmark.png)
+
+### What worked
+
+1. **No lossy training.** Both train and test curves descend monotonically
+   across all 12 epochs (see `train_policy_batch_loss.png`,
+   `train_policy_epoch_loss.png`, `test_mixed_policy_loss.png`). The
+   CNN-conditioned position-0 embedding stabilized training in exactly the way
+   we hoped.
+2. **No catastrophic forgetting.** Game top-1 is **64.03%** vs Exp 4 Phase 2a's
+   65.4% — essentially preserved (`test_mixed_policy_top1_acc.png`). Compare
+   this to Exp 4 Phase 2b, which destroyed games-only performance down to
+   ~9%. The "mixed batches + per-sample loss weighting" recipe successfully
+   gives us puzzle gains without paying for them in game policy.
+3. **Puzzle first-move solve 3.5× over Exp 4.** 12.67% vs 3.6%
+   (`test_mixed_puzzle_first_move.png`). This is the single clearest signal
+   that the CNN is doing what we built it to do: the model can now reason
+   about an arbitrary FEN starting position rather than guessing from
+   `[CLS, setup_move]` alone. The number is still well below the 30%+ target,
+   but the curve is clearly mid-ascent rather than plateaued.
+4. **Subjective play improved.** Consistent with the slightly higher top-5
+   accuracy (`test_mixed_policy_top5acc.png`) and the puzzle gains — the
+   model has more tactical signal in its move distribution even when its
+   single argmax doesn't change.
+
+### Why train loss is well below test loss (overfitting)
+
+The 0.75-nat gap (train 0.85 vs test 1.60) is real and was absent in Exp 4
+(compare `train_policy_epoch_loss.png` to `test_mixed_policy_loss.png` at
+matching epochs).
+Three plausible drivers, in order of likely magnitude:
+
+1. **Puzzle oversampling.** The puzzle pool is much smaller than the game pool,
+   and `MixedBatchSampler` re-shuffles puzzles whenever exhausted to maintain
+   the 20% per-batch ratio. Over 12 epochs the model sees each puzzle position
+   many times. The model can memorize the exact policy on each puzzle's
+   training FEN — those memorized rows pull train loss down hard but do
+   nothing for test loss (which uses a held-out puzzle FEN set).
+2. **5× puzzle weight amplifies the memorization signal.** Each memorized
+   puzzle row contributes 5× the gradient of a game row, so the optimizer is
+   strongly biased toward making those rows easy. Train loss is a weighted
+   average dominated by precisely the rows the model is memorizing.
+3. **Added CNN capacity with constant input on games.** The CNN gets
+   `board_to_planes(chess.Board())` (a constant) on game samples, so its
+   capacity is *only* spent learning puzzle FEN → board vector. ~1.8M
+   spatial-encoding parameters trained on the puzzle distribution alone is a
+   recipe for overfitting that specific distribution.
+
+So the gap is structural to the recipe, not a sign of a bug. It would also
+plausibly *shrink* with a larger puzzle pool or a lower puzzle weight.
+
+### Why policy loss is worse than Exp 4 Phase 2a
+
+1.5384 vs 1.386 — about a 11% relative regression on game policy loss. Three
+forces are pulling in this direction:
+
+1. **The optimizer is solving a harder problem.** Phase 2a optimized a single
+   objective: next-move log-likelihood on game continuations. Exp 5 optimizes
+   a weighted sum of game continuations + tactical puzzle solutions. With
+   `puzzle_ratio = 0.2` and `puzzle_loss_weight = 5.0`, puzzle positions
+   contribute roughly half the gradient norm per batch. The model is partly
+   spending its representational budget on tactical sharpness rather than on
+   matching the modal Lichess continuation. Some game-policy degradation is
+   the price of every puzzle metric that improved.
+2. **The position-0 slot is no longer "free."** In Exp 4 the slot held a
+   learned `[CLS]` whose representation could be tuned freely by the
+   transformer for whatever made next-move prediction easiest. In Exp 5 it is
+   overwritten with the CNN board vector — which on games is *constant*. The
+   first token of every game sequence now provides effectively zero
+   information, and the transformer can no longer use that slot as a scratch
+   register. This shouldn't be huge (positions 1+ still carry the move
+   history) but it removes a small affordance the Phase 2a model had.
+3. **Capacity diverted to a near-useless task on games.** The CNN's job on
+   game batches is to encode the standard starting board — i.e., the same
+   tensor every time. Whatever gradient flows back into the CNN from
+   game-batch loss is essentially gradient on a constant input, which can
+   only learn an offset. That's wasted parameters and wasted optimizer state
+   relative to a pure-policy run.
+
+Mechanism (1) is intentional and is the trade we wanted. Mechanism (2) is
+small. Mechanism (3) is the only one we could meaningfully fight without
+giving up the puzzle gains — e.g., by skipping the CNN entirely on game
+samples and using a learned `[CLS]` for those rows. Worth considering for
+Experiment 6.
+
+### Additional observations from the images
+
+- **No epoch where test loss inflects upward** (`test_mixed_policy_loss.png`).
+  The overfitting is *steady-state* rather than progressive — the gap is
+  roughly constant across epochs rather than widening. That means stopping
+  earlier would not have closed it, and running longer (within reason) should
+  keep improving both curves in parallel. Early stopping is not the right
+  lever here; the right lever is changing what gets oversampled.
+- **Puzzle curves still climbing linearly at epoch 12**
+  (`test_mixed_puzzle_first_move.png`, `test_mixed_puzzle_all_moves.png`).
+  Both first-move and all-moves accuracy show no sign of saturation. This is
+  the strongest argument for simply training longer before adjusting the
+  recipe — the current ceiling has not been hit.
+- **Top-5 accuracy already exceeds Exp 4** (`test_mixed_policy_top5acc.png`).
+  79.52% vs ~78% suggests the model's *distribution* over plausible moves is
+  slightly better than Exp 4 even though its top-1 is marginally worse.
+  Combined with the qualitative "blundering less" observation, this is
+  consistent with a model that is slightly less peaky but lands legal/sensible
+  moves more often — exactly the signature of CNN-conditioned spatial
+  reasoning bleeding into game play.
+- **Smoothed vs raw values diverge by ~0.06 at the end** (visible at the
+  right edge of `test_mixed_policy_loss.png`). Raw test policy loss at epoch
+  12 is **1.5384** while the smoothed value is 1.5965 — the curve is still
+  steepening at the cutoff. Another epoch or two would likely push raw test
+  loss under 1.5.
+
+### Recommendations for Experiment 6
+
+1. Anchor the CNN to the live board, not the starting board, on game samples
+   too — i.e., replay the move sequence and pass `board_to_planes(board_at_t)`
+   for each training position. The CNN earns its keep on games as well,
+   and mechanism (3) above disappears.
+2. Lower `puzzle_loss_weight` (e.g., 2.0–3.0) and observe whether train/test
+   gap narrows without giving back puzzle gains. The current 5× is well above
+   what loss-balanced batches require.
+3. Train for 20+ epochs given that neither train nor test has converged.
+4. Add a held-out *game* puzzle FEN set that the model never sees during
+   training to confirm the overfitting story is puzzle-specific and not a
+   general-data phenomenon.

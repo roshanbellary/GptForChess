@@ -61,11 +61,8 @@ class ResidualBlock(nn.Module):
         h = torch.relu(self.norm1(self.conv1(x)))
         h = self.norm2(self.conv2(h))
         return torch.relu(h + x)
-
-
 class BoardCNN(nn.Module):
-    """(B, 19, 8, 8) -> (B, d_model): one context-rich vector per board."""
-    def __init__(self, d_model: int, channels: int = 128, num_blocks: int = 6):
+    def __init__(self, d_model, channels=128, num_blocks=6):
         super().__init__()
         self.stem = nn.Sequential(
             nn.Conv2d(BOARD_PLANES, channels, 3, padding=1, bias=False),
@@ -73,15 +70,58 @@ class BoardCNN(nn.Module):
             nn.ReLU(inplace=True),
         )
         self.blocks = nn.Sequential(*[ResidualBlock(channels) for _ in range(num_blocks)])
-        self.pool = nn.AdaptiveAvgPool2d(1)
         self.proj = nn.Linear(channels, d_model)
+        self.square_pos = nn.Embedding(64, d_model)
 
-    def forward(self, planes: torch.Tensor) -> torch.Tensor:
+    def forward(self, planes : torch.Tensor) -> torch.Tensor:
         x = self.stem(planes)
-        x = self.blocks(x)
-        x = self.pool(x).flatten(1)   # (B, channels)
-        return self.proj(x)           # (B, d_model)
+        x = self.blocks(x) # (N, C, 8, 8)
+        x = x.permute(0, 2, 3, 1).reshape(x.size(0), 64, -1) # (n, 64, C)
+        x = self.proj(x) + self.square_pos.weight # (n, 64, d_model)
+        return x
 
+
+class CrossAttnBlock(nn.Module):
+    def __init__(self, d_model, n_head, dim_ff, dropout):
+        super().__init__()
+        self.self_attn = nn.MultiheadAttention(d_model, n_head, dropout = dropout, batch_first=True)
+
+        self.cross_attn = nn.MultiheadAttention(d_model, n_head, dropout = dropout, batch_first = True)
+
+        self.ff = nn.Sequential(
+            nn.Linear(d_model, dim_ff), nn.GELU(), nn.Linear(dim_ff, d_model)
+        )
+
+        self.norm1 = nn.LayerNorm(d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.norm3 = nn.LayerNorm(d_model)
+        self.drop = nn.Dropout(dropout)
+        #Adding this gate which is init to 0 so cross-attn starts disabled
+        self.cross_gate = nn.Parameter(torch.zeros(1))
+
+    def forward(self, moves, board, key_padding_mask, attn_mask):
+        """
+        moves:             (B, T, d)
+        board:             (B, T, 64, d)  -- per-position K/V banks
+        key_padding_mask:  (B, T)         -- True = padded move position
+        attn_mask:         (T, T)         -- causal mask for self-attn
+        """
+        m = self.norm1(moves)
+        sa, _ = self.self_attn(m, m, m, attn_mask = attn_mask, key_padding_mask=key_padding_mask, need_weights=False)
+
+        moves = moves + self.drop(sa)
+
+        B, T, d = moves.shape
+        q = self.norm2(moves).reshape(B * T, 1, d)
+        kv = board.reshape(B * T, 64, d)
+        ca, _ = self.cross_attn(q, kv, kv, need_weights = False)
+        ca = ca.reshape(B, T, d)
+        moves = moves + self.drop(self.cross_gate.tanh() * ca)
+
+        # FFN
+
+        moves = moves + self.drop(self.ff(self.norm3(moves)))
+        return moves
 
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model: int, max_len: int = 512, dropout: float = 0.1):
@@ -140,6 +180,20 @@ class ChessRewardModel(nn.Module):
         return torch.tanh(reward)
     
 class ChessPolicyModel(nn.Module):
+    """Causal next-move predictor with per-position live-board cross-attention.
+
+    Two streams flow through every block:
+      - Move stream: token embeddings + sinusoidal positional encoding, doing
+        causal self-attention over the move history.
+      - Board stream: a (B, T, 64, d_model) bank of CNN-encoded board features
+        where bank `t` is the state after token_ids[1..t] have been played.
+        At each block, the move query at position t cross-attends only to its
+        own 64 board-square keys — implicit causality via data layout, no
+        masking needed.
+
+    The board representation never depends on a token the model is being
+    asked to predict, so multi-position LM-style training is leak-safe.
+    """
     def __init__(
         self,
         vocab_size: int,
@@ -157,10 +211,11 @@ class ChessPolicyModel(nn.Module):
         self.token_embedding = nn.Embedding(vocab_size, d_model)
         self.board_cnn = BoardCNN(d_model, cnn_channels, cnn_blocks)
         self.pos_encoding = PositionalEncoding(d_model, max_seq_len, dropout)
-        encoder_layer = nn.TransformerEncoderLayer(
-            d_model, nhead, dim_feedforward, dropout, batch_first=True
-        )
-        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+        self.blocks = nn.ModuleList([
+            CrossAttnBlock(d_model, nhead, dim_feedforward, dropout)
+            for _ in range(num_layers)
+        ])
+        self.norm_out = nn.LayerNorm(d_model)
         self.prob_head = nn.Linear(d_model, vocab_size)
 
     def forward(
@@ -171,22 +226,33 @@ class ChessPolicyModel(nn.Module):
     ) -> torch.Tensor:
         """
         Args:
-            token_ids: (batch, seq_len) int tensor with CLS as BOS at position 0
-            board_planes: (batch, 19, 8, 8) float tensor of the current board
-            attention_mask: (batch, seq_len) bool tensor, True where padded
+            token_ids:      (B, T) int — CLS at position 0
+            board_planes:   (B, T, 19, 8, 8) float — per-position live planes;
+                            planes[:, t] is the board state after token_ids[1..t]
+            attention_mask: (B, T) bool — True where padded
         Returns:
-            (batch, seq_len, vocab_size) raw logits at every position
+            (B, T, vocab_size) raw logits at every position
         """
-        move_emb = self.token_embedding(token_ids)              # (B, T, d)
-        board_emb = self.board_cnn(board_planes).unsqueeze(1)   # (B, 1, d)
-        # Replace position-0 (CLS) with the board summary so the move sequence
-        # is conditioned on the current state without growing the sequence.
-        x = torch.cat([board_emb, move_emb[:, 1:, :]], dim=1)   # (B, T, d)
-        x = self.pos_encoding(x)
-        seq_len = token_ids.size(1)
-        causal_mask = nn.Transformer.generate_square_subsequent_mask(seq_len, device=token_ids.device)
-        x = self.encoder(x, mask=causal_mask, src_key_padding_mask=attention_mask)
-        return self.prob_head(x)  # (batch, seq_len, vocab_size)
+        B, T = token_ids.shape
+
+        moves = self.token_embedding(token_ids)
+        moves = self.pos_encoding(moves)                          # (B, T, d)
+
+        # Vectorize the CNN over (B*T) boards — one big conv batch, not a loop.
+        planes_flat = board_planes.reshape(B * T, BOARD_PLANES, 8, 8)
+        board_feats = self.board_cnn(planes_flat)                 # (B*T, 64, d)
+        board_feats = board_feats.reshape(B, T, 64, -1)           # (B, T, 64, d)
+
+        # Bool causal mask (True = masked future position) to match the bool
+        # key_padding_mask. PyTorch deprecates mixing float and bool masks.
+        causal = torch.triu(
+            torch.ones(T, T, dtype=torch.bool, device=token_ids.device), diagonal=1
+        )
+        for blk in self.blocks:
+            moves = blk(moves, board_feats, attention_mask, causal)
+
+        moves = self.norm_out(moves)
+        return self.prob_head(moves)                              # (B, T, vocab)
 
 
 class DummyRewardModel:
@@ -234,15 +300,27 @@ class PolicyModelInference:
     
     @torch.no_grad()
     def __call__(self, board: chess.Board, max_seq_len: int = 128) -> str:
-        moves_uci = [move.uci() for move in board.move_stack]
-
-        moves_uci = moves_uci[-(max_seq_len - 1):]
+        moves_uci = [move.uci() for move in board.move_stack][-(max_seq_len - 1):]
         token_ids = [self.cls_id] + self.tokenizer.encode_moves(moves_uci)
         token_tensor = torch.tensor([token_ids], dtype=torch.long, device=self.device)
-        planes = board_to_planes(board).unsqueeze(0).to(self.device)
 
-        logits = self.model(token_tensor, planes)  # (1, seq_len, vocab_size)
-        last_logits = logits[0, -1]                # (vocab_size,) — last position has full history
+        # Build (1, T, 19, 8, 8) per-position planes matching the training-time
+        # leak-safe layout: planes[0, t] is the board state after the first t
+        # *kept* moves have been played. If the history was truncated to fit
+        # max_seq_len, we replay the dropped moves onto a fresh board first so
+        # planes[0, 0] reflects the right starting state for the kept window.
+        replay_board = chess.Board()
+        n_skipped = len(board.move_stack) - len(moves_uci)
+        for m in board.move_stack[:n_skipped]:
+            replay_board.push(m)
+        plane_list = [board_to_planes(replay_board)]
+        for uci in moves_uci:
+            replay_board.push(chess.Move.from_uci(uci))
+            plane_list.append(board_to_planes(replay_board))
+        planes = torch.stack(plane_list).unsqueeze(0).to(self.device)  # (1, T, 19, 8, 8)
+
+        logits = self.model(token_tensor, planes)  # (1, T, vocab_size)
+        last_logits = logits[0, -1]                # last position predicts the next move
 
         legal_move_ids = [self.tokenizer.symbol_to_token[move.uci()] for move in board.legal_moves]
         mask = torch.full((self.tokenizer.language_size,), float('-inf'), device=self.device)

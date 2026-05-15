@@ -79,16 +79,33 @@ def _save_as_memmap(
 def stage1_collect_games(args: argparse.Namespace) -> None:
     policy_games_path = args.out_dir / "games_outcome.pt"
     reward_games_path = args.out_dir / "games_stockfish.pt"
-    if policy_games_path.exists() and reward_games_path.exists() and not args.force:
-        print(f"Stage 1: skipping — {policy_games_path.name} and {reward_games_path.name} exist.")
-        return
+    policy_only = getattr(args, "policy_only", False)
 
-    lower_elo = min(args.reward_min_elo, args.policy_min_elo)
-    print(
-        f"Stage 1: streaming Lichess/standard-chess-games (Termination == 'Normal'), "
-        f"reward Elo >= {args.reward_min_elo} (target {args.reward_games:,}), "
-        f"policy Elo >= {args.policy_min_elo} (target {args.policy_games:,})..."
-    )
+    if policy_only:
+        # Reward subset is irrelevant when we're only training the policy model.
+        # Skip-condition checks only the policy artifact.
+        if policy_games_path.exists() and not args.force:
+            print(f"Stage 1: skipping — {policy_games_path.name} exists (--policy-only).")
+            return
+    else:
+        if policy_games_path.exists() and reward_games_path.exists() and not args.force:
+            print(f"Stage 1: skipping — {policy_games_path.name} and {reward_games_path.name} exist.")
+            return
+
+    if policy_only:
+        lower_elo = args.policy_min_elo
+        print(
+            f"Stage 1: streaming Lichess/standard-chess-games (Termination == 'Normal'), "
+            f"policy Elo >= {args.policy_min_elo} (target {args.policy_games:,}). "
+            f"Reward subset skipped (--policy-only)."
+        )
+    else:
+        lower_elo = min(args.reward_min_elo, args.policy_min_elo)
+        print(
+            f"Stage 1: streaming Lichess/standard-chess-games (Termination == 'Normal'), "
+            f"reward Elo >= {args.reward_min_elo} (target {args.reward_games:,}), "
+            f"policy Elo >= {args.policy_min_elo} (target {args.policy_games:,})..."
+        )
 
     ds = load_dataset("Lichess/standard-chess-games", split="train", streaming=True)
     # Pre-filter by the lower of the two thresholds to skip clearly ineligible games.
@@ -111,23 +128,38 @@ def stage1_collect_games(args: argparse.Namespace) -> None:
         black_elo = row.get("BlackElo", 0)
         minimal = {k: row.get(k) for k in keep_keys}
 
-        if len(reward_games) < args.reward_games and white_elo >= args.reward_min_elo and black_elo >= args.reward_min_elo:
+        if (
+            not policy_only
+            and len(reward_games) < args.reward_games
+            and white_elo >= args.reward_min_elo
+            and black_elo >= args.reward_min_elo
+        ):
             reward_games.append(minimal)
 
         if len(policy_games) < args.policy_games and white_elo >= args.policy_min_elo and black_elo >= args.policy_min_elo:
             policy_games.append(minimal)
 
-        if len(reward_games) >= args.reward_games and len(policy_games) >= args.policy_games:
+        if policy_only:
+            if len(policy_games) >= args.policy_games:
+                break
+        elif len(reward_games) >= args.reward_games and len(policy_games) >= args.policy_games:
             break
 
-    if len(reward_games) < args.reward_games or len(policy_games) < args.policy_games:
+    if policy_only:
+        if len(policy_games) < args.policy_games:
+            print(
+                f"  WARNING: dataset exhausted before target — "
+                f"got {len(policy_games):,} policy games."
+            )
+    elif len(reward_games) < args.reward_games or len(policy_games) < args.policy_games:
         print(
             f"  WARNING: dataset exhausted before target — "
             f"got {len(reward_games):,} reward + {len(policy_games):,} policy games."
         )
 
-    print(f"Stage 1: saving {reward_games_path} ({len(reward_games):,} games)...")
-    torch.save(reward_games, reward_games_path)
+    if not policy_only:
+        print(f"Stage 1: saving {reward_games_path} ({len(reward_games):,} games)...")
+        torch.save(reward_games, reward_games_path)
     print(f"Stage 1: saving {policy_games_path} ({len(policy_games):,} games)...")
     torch.save(policy_games, policy_games_path)
 
@@ -432,11 +464,14 @@ def stage_build_test_splits(args: argparse.Namespace, out_dir: Path) -> None:
       policy_test_*.bin    / policy_test_meta.pt    / policy_test_indices.npy
     """
     rng = np.random.default_rng(42)
+    policy_only = getattr(args, "policy_only", False)
 
-    # Reward test set
+    # Reward test set — skipped when --policy-only since no Stockfish data exists.
     reward_test_meta = out_dir / "stockfish_test_meta.pt"
     sf_meta_path = out_dir / "stockfish_meta.pt"
-    if (not reward_test_meta.exists() or args.force) and sf_meta_path.exists():
+    if policy_only:
+        print("Test splits: stockfish_test skipped (--policy-only).")
+    elif (not reward_test_meta.exists() or args.force) and sf_meta_path.exists():
         print(f"Test splits: building stockfish_test ({args.reward_test_size:,} samples)...")
         sf_meta = torch.load(sf_meta_path, weights_only=True)
         n = sf_meta["n"]
@@ -562,6 +597,12 @@ def main():
         help="Only run Stage 5 (puzzle processing). Skips game collection, "
              "outcome/Stockfish/policy memmaps, and test splits. Requires "
              "tokenizer.pt to exist (or it will be built from the UCI vocab).")
+    parser.add_argument("--policy-only", action="store_true",
+        help="Skip everything Stockfish/reward-related: Stage 1 collects only "
+             "policy games, Stage 3 (Stockfish labeling) is skipped, and the "
+             "stockfish_test split is not built. Stages 1/2/4/5 + policy_test "
+             "still run, producing tokenizer.pt, policy_* / puzzle_* memmaps, "
+             "and the policy_test split.")
     parser.add_argument("--puzzle-test-size", type=int, default=100_000, dest="puzzle_test_size",
         help="Number of puzzle sequences held out for the test set (default: 100000)")
     parser.add_argument("--reward-test-size", type=int, default=50_000, dest="reward_test_size",
@@ -571,6 +612,9 @@ def main():
     args = parser.parse_args()
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
+
+    if args.puzzles_only and args.policy_only:
+        parser.error("--puzzles-only and --policy-only are mutually exclusive.")
 
     if args.puzzles_only:
         print("--puzzles-only: skipping Stages 1-4 and test-split builder.")
@@ -583,6 +627,20 @@ def main():
             tokenizer = build_tokenizer_from_games()
             torch.save(tokenizer, tokenizer_path)
         stage5_puzzle_samples(args, tokenizer, args.out_dir)
+    elif args.policy_only:
+        print("--policy-only: skipping Stage 3 (Stockfish labeling) and stockfish_test split.")
+        stage1_collect_games(args)
+        stage2_outcome_samples(args)
+        stage4_policy_sequences(args)
+
+        tokenizer_path = args.out_dir / "tokenizer.pt"
+        if not args.skip_puzzles and tokenizer_path.exists():
+            tokenizer = torch.load(tokenizer_path, weights_only=False)
+            stage5_puzzle_samples(args, tokenizer, args.out_dir)
+        elif not args.skip_puzzles:
+            print("Stage 5: skipping — tokenizer.pt not found (run stages 1-2 first).")
+
+        stage_build_test_splits(args, args.out_dir)
     else:
         stage1_collect_games(args)
         stage2_outcome_samples(args)

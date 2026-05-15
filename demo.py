@@ -220,7 +220,7 @@ def promote_dialog(surf, label_font, color: chess.Color) -> chess.PieceType:
 def parse_args():
     parser = argparse.ArgumentParser(description='GptForChess pygame demo')
     parser.add_argument('--policy-model', type=str,
-                        default='experiments/experiment_4/policy_model_phase2a.pt',
+                        default='experiments/experiment_5/policy_model.pt',
                         help='Path to ChessPolicyModel state_dict (used to choose AI moves). '
                              'Defaults to the Phase 2a checkpoint from Experiment 4 — the strong '
                              'games-only baseline (top-1 65.4%, top-5 81.9%).')

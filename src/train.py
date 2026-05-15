@@ -480,19 +480,28 @@ def collate_fn_memmap(batch):
 
 
 def collate_fn_policy(batch):
-    """Pad token sequences for policy training.
+    """Pad token sequences and per-position board planes for policy training.
 
-    Each batch element is (tokens, planes, weight, source_tag). Returns
-    (padded_tokens, attention_mask, planes, weights, sources).
+    Each batch element is (tokens, planes, weight, source_tag) where
+    `tokens` is shape (L,) long and `planes` is shape (L, 19, 8, 8) float —
+    one set of board planes per position in the sequence. We pad both
+    along the sequence dimension to the batch's max length. Padded
+    positions get zero token, zero planes, and mask=True; downstream
+    loss masking ignores them.
+
+    Returns (padded_tokens, attention_mask, planes, weights, sources).
     """
     tokens_list, planes_list, weights_list, sources_list = zip(*batch)
+    B = len(tokens_list)
     max_len = max(len(t) for t in tokens_list)
-    padded = torch.zeros(len(tokens_list), max_len, dtype=torch.long)
-    mask = torch.ones(len(tokens_list), max_len, dtype=torch.bool)  # True = padded
-    for i, t in enumerate(tokens_list):
-        padded[i, :len(t)] = t
-        mask[i, :len(t)] = False
-    planes = torch.stack(list(planes_list))
+    padded = torch.zeros(B, max_len, dtype=torch.long)
+    mask = torch.ones(B, max_len, dtype=torch.bool)  # True = padded
+    planes = torch.zeros(B, max_len, 19, 8, 8)
+    for i, (t, p) in enumerate(zip(tokens_list, planes_list)):
+        L = len(t)
+        padded[i, :L] = t
+        mask[i, :L] = False
+        planes[i, :L] = p
     weights = torch.tensor(weights_list, dtype=torch.float)
     sources = torch.tensor(sources_list, dtype=torch.long)
     return padded, mask, planes, weights, sources
@@ -556,10 +565,13 @@ class ChessPolicyDataset(Dataset):
     Each sample yields (token_ids, board_planes, weight, source_tag):
 
     - token_ids:    full tokenized sequence [CLS, m1, m2, ..., mN]
-    - board_planes: (19, 8, 8) tensor representing the *starting* board of
-                    the sequence. For games this is the standard chess start
-                    (cached and shared across all samples); for puzzles this
-                    is the FEN-derived board from `{name}_fens.bin`.
+    - board_planes: (L, 19, 8, 8) tensor of per-position planes built by
+                    replaying the move sequence. planes[0] is the starting
+                    board (the standard chess start for games, the puzzle
+                    FEN for puzzles); planes[t] is the board state after
+                    token_ids[1..t] have been played. This is the
+                    information-leak-safe per-position anchor that lets the
+                    model cross-attend to the live board at every step.
     - weight:       per-sample loss weight (1.0 for games, default 5.0 for
                     puzzles) so puzzle samples have outsized gradient pull.
     - source_tag:   0 = game, 1 = puzzle. Used by the mixed training loop to
@@ -567,11 +579,11 @@ class ChessPolicyDataset(Dataset):
     """
     def __init__(self, games: list[dict], tokenizer: Tokenizer, max_seq_len: int = 128):
         cls_id = tokenizer.symbol_to_token[CLS_TOKEN]
+        self.tokenizer = tokenizer
         self._memmap = False
         self._train_idx: np.ndarray | None = None
         self._mm_fens = None
         self._fen_len = None
-        self._starting_planes: torch.Tensor | None = None
         self.source_tag: int = 0
         self.loss_weight: float = 1.0
         self.samples: list[list[int]] = []
@@ -596,22 +608,22 @@ class ChessPolicyDataset(Dataset):
             move_ucis = move_ucis[:max_seq_len - 1]  # reserve slot for CLS
             self.samples.append([cls_id] + tokenizer.encode_moves(move_ucis))
 
-    def _get_starting_planes(self) -> torch.Tensor:
-        if self._starting_planes is None:
-            self._starting_planes = board_to_planes(chess.Board())
-        return self._starting_planes
+    def _get_start_board(self, idx: int) -> chess.Board:
+        """Resolve the starting board for the per-position replay.
 
-    def _planes_for(self, idx: int) -> torch.Tensor:
-        if self._mm_fens is None:
-            return self._get_starting_planes()
-        fen_bytes = bytes(self._mm_fens[idx])
-        fen_str = fen_bytes.rstrip(b"\x00").decode("ascii")
-        try:
-            return board_to_planes(chess.Board(fen_str))
-        except ValueError:
-            # Corrupt FEN — fall back to starting position so the loader
-            # doesn't crash. Skipping the sample would mis-align the sampler.
-            return self._get_starting_planes()
+        Puzzles with a `{name}_fens.bin` sidecar use the puzzle's FEN.
+        Everything else (games, puzzles without FENs) starts from the
+        standard chess starting position. A corrupt FEN silently falls
+        back to the starting position so the loader doesn't crash.
+        """
+        if self._memmap and self._mm_fens is not None:
+            fen_bytes = bytes(self._mm_fens[idx])
+            fen_str = fen_bytes.rstrip(b"\x00").decode("ascii")
+            try:
+                return chess.Board(fen_str)
+            except ValueError:
+                return chess.Board()
+        return chess.Board()
 
     def __len__(self) -> int:
         if self._memmap:
@@ -626,10 +638,10 @@ class ChessPolicyDataset(Dataset):
                 idx = int(self._train_idx[idx])
             length = int(self._mm_lengths[idx])
             tokens = torch.from_numpy(np.array(self._mm_tokens[idx, :length], dtype=np.int32)).long()
-            planes = self._planes_for(idx)
         else:
             tokens = torch.tensor(self.samples[idx], dtype=torch.long)
-            planes = self._get_starting_planes()
+        start_board = self._get_start_board(idx)
+        planes = self._replay_planes(tokens.tolist(), start_board)
         return tokens, planes, self.loss_weight, self.source_tag
 
     @classmethod
@@ -683,11 +695,35 @@ class ChessPolicyDataset(Dataset):
                     f"updated build_datasets.py to fix."
                 )
 
+        inst.tokenizer = tokenizer
         inst.source_tag = source_tag
         inst.loss_weight = loss_weight
-        inst._starting_planes = None
         return inst
+    def _replay_planes(self, token_ids: list[int], start_board: chess.Board) -> torch.Tensor:
+        """Returns (L, 19, 8, 8) tensor of board planes per position.
 
+        plane_t = state of the board after token_ids[1..t] have been played.
+        plane_0 = start_board (the model has only seen [CLS] at that point).
+
+        If a token in the sequence isn't a parseable UCI move (corrupt
+        data, non-move special token mid-stream), we freeze planes at the
+        last valid state and return. The loss already masks padded targets,
+        so the worst case is a few positions with stale board input rather
+        than a crashed worker.
+        """
+        L = len(token_ids)
+        planes = torch.zeros(L, 19, 8, 8)
+        board = start_board.copy()
+        planes[0] = board_to_planes(board)
+        for t in range(1, L):
+            uci = self.tokenizer.token_to_symbol[int(token_ids[t])]
+            try:
+                board.push(chess.Move.from_uci(uci))
+            except (chess.InvalidMoveError, ValueError):
+                planes[t:] = planes[t - 1]
+                return planes
+            planes[t] = board_to_planes(board)
+        return planes
 
 def _fmt_duration(seconds: float) -> str:
     h, m = divmod(int(seconds), 3600)
@@ -1086,18 +1122,20 @@ def train(
         game_ds = ChessPolicyDataset(outcome_games, tokenizer, max_seq_len=max_seq_len)
     print(f"Game dataset: {len(game_ds):,} sequences")
 
-    # Puzzle dataset (optional — falls back to game-only training if absent)
+    # Puzzle dataset (optional — falls back to game-only training if absent).
+    # If --puzzle-data isn't passed, look for puzzle_*.bin alongside policy_*.bin
+    # so a `build_datasets.py --policy-only` layout (everything in data/) is
+    # picked up automatically without an extra CLI flag.
     puzzle_ds = None
-    if puzzle_data_dir is not None:
-        pdir = Path(puzzle_data_dir)
-        if (pdir / "puzzle_meta.pt").exists():
-            puzzle_ds = ChessPolicyDataset.from_memmap(
-                pdir, tokenizer, name="puzzle",
-                source_tag=1, loss_weight=puzzle_loss_weight,
-            )
-            print(f"Puzzle dataset: {len(puzzle_ds):,} sequences (loss_weight={puzzle_loss_weight}x)")
-        else:
-            print(f"WARNING: --puzzle-data given but {pdir}/puzzle_meta.pt not found.")
+    pdir = Path(puzzle_data_dir) if puzzle_data_dir is not None else policy_data_dir_early
+    if (pdir / "puzzle_meta.pt").exists():
+        puzzle_ds = ChessPolicyDataset.from_memmap(
+            pdir, tokenizer, name="puzzle",
+            source_tag=1, loss_weight=puzzle_loss_weight,
+        )
+        print(f"Puzzle dataset ({pdir}): {len(puzzle_ds):,} sequences (loss_weight={puzzle_loss_weight}x)")
+    elif puzzle_data_dir is not None:
+        print(f"WARNING: --puzzle-data given but {pdir}/puzzle_meta.pt not found.")
 
     if puzzle_ds is not None:
         mixed_ds = torch.utils.data.ConcatDataset([game_ds, puzzle_ds])
@@ -1145,8 +1183,40 @@ def train(
                 f"  all_moves={m['all_moves_solve_rate']:.3f}"
             )
 
+    def _log_cross_gates(epoch_num: int) -> None:
+        """Log per-block cross-attention gate values to TensorBoard.
+
+        Each CrossAttnBlock has a single learned scalar `cross_gate` whose
+        tanh controls how much board cross-attention contributes through
+        its residual (init=0 means cross-attn starts disabled). Tracking
+        these over epochs shows which layers opened the board pathway and
+        how fast — flat-at-zero across all layers means the model decided
+        cross-attention wasn't worth it.
+
+        TB tags:
+          cross_gate/block_{i}      effective gate tanh(α) ∈ (-1, 1)
+          cross_gate_raw/block_{i}  raw parameter α (unbounded)
+        """
+        blocks = getattr(policy_model, "blocks", None)
+        if blocks is None:
+            return  # Older model variants without CrossAttnBlock stack.
+        gates_tanh = {}
+        for i, blk in enumerate(blocks):
+            raw = blk.cross_gate.detach()
+            tanh_val = raw.tanh().item()
+            raw_val = raw.item()
+            writer.add_scalar(f"cross_gate/block_{i}", tanh_val, epoch_num)
+            writer.add_scalar(f"cross_gate_raw/block_{i}", raw_val, epoch_num)
+            gates_tanh[f"block_{i}"] = tanh_val
+        # Overlay all blocks on a single chart for easy at-a-glance comparison.
+        writer.add_scalars("cross_gate_all", gates_tanh, epoch_num)
+        gate_summary = "  ".join(f"L{i}={v:+.3f}" for i, v in enumerate(gates_tanh.values()))
+        print(f"  [cross_gate]  {gate_summary}")
+
     print(f"\n── Phase 2: mixed policy training — {policy_epochs} epochs, lr={learning_rate}")
     phase2_start = time.time()
+    # Log initial gate values (all zeros at init) so TB charts start at epoch 0.
+    _log_cross_gates(0)
     for epoch in range(policy_epochs):
         epoch_num = epoch + 1
         print(f"  [epoch {epoch_num}/{policy_epochs}] starting...")
@@ -1161,6 +1231,7 @@ def train(
             f"eta={_fmt_duration(epoch_secs * epochs_left)}"
         )
         _run_policy_test(epoch_num, "test_mixed")
+        _log_cross_gates(epoch_num)
 
     print(f"Phase 2 complete in {_fmt_duration(time.time() - phase2_start)}")
     torch.save(policy_model.state_dict(), "policy_model.pt")
