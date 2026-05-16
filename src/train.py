@@ -994,6 +994,7 @@ def train(
     puzzle_loss_weight=5.0,
     puzzle_ratio=0.2,
     skip_reward=False,
+    keep_last_n_checkpoints=3,
 ):
     """Train the reward model then the policy model.
 
@@ -1186,6 +1187,27 @@ def train(
                 f"  all_moves={m['all_moves_solve_rate']:.3f}"
             )
 
+    def _save_epoch_checkpoint(epoch_num: int) -> None:
+        """Save the policy model after a completed epoch.
+
+        Each checkpoint is `policy_model_epoch_{NN}.pt` next to the final
+        `policy_model.pt`. If `keep_last_n_checkpoints > 0`, older
+        checkpoints are pruned to cap disk usage. The final end-of-Phase-2
+        save (`policy_model.pt`) is kept regardless of this setting and
+        always reflects the last completed epoch.
+        """
+        ckpt_path = Path(f"policy_model_epoch_{epoch_num:02d}.pt")
+        torch.save(policy_model.state_dict(), ckpt_path)
+        print(f"  [checkpoint]  saved {ckpt_path.name}")
+        if keep_last_n_checkpoints and keep_last_n_checkpoints > 0:
+            existing = sorted(Path(".").glob("policy_model_epoch_*.pt"))
+            stale = existing[:-keep_last_n_checkpoints]
+            for p in stale:
+                try:
+                    p.unlink()
+                except OSError:
+                    pass
+
     def _log_cross_gates(epoch_num: int) -> None:
         """Log per-block cross-attention gate values to TensorBoard.
 
@@ -1235,6 +1257,7 @@ def train(
         )
         _run_policy_test(epoch_num, "test_mixed")
         _log_cross_gates(epoch_num)
+        _save_epoch_checkpoint(epoch_num)
 
     print(f"Phase 2 complete in {_fmt_duration(time.time() - phase2_start)}")
     torch.save(policy_model.state_dict(), "policy_model.pt")
@@ -1267,6 +1290,10 @@ def _build_argparser():
     p.add_argument("--skip-reward", action="store_true", dest="skip_reward",
         help="Skip Phase 1 (reward model training). Existing reward_model.pt is "
              "left untouched. Use when iterating on Phase 2 only.")
+    p.add_argument("--keep-last-n-checkpoints", type=int, default=3, dest="keep_last_n_checkpoints",
+        help="Number of per-epoch policy_model_epoch_NN.pt files to keep on disk "
+             "(default 3). Use 0 to keep all epochs. Final policy_model.pt is kept "
+             "regardless.")
     return p
 
 
@@ -1288,4 +1315,5 @@ if __name__ == "__main__":
         puzzle_loss_weight=args.puzzle_loss_weight,
         puzzle_ratio=args.puzzle_ratio,
         skip_reward=args.skip_reward,
+        keep_last_n_checkpoints=args.keep_last_n_checkpoints,
     )
