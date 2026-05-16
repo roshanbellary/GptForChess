@@ -819,6 +819,7 @@ def _run_epoch_policy_mixed(
 
         input_tokens = batch_tokens[:, :-1]
         input_mask = batch_mask[:, :-1]
+        input_planes = batch_planes[:, :-1]  # planes are per-position; slice with tokens
         targets = batch_tokens[:, 1:].contiguous()
 
         # Mask the setup-move target (position 0 of the shifted target) for
@@ -829,7 +830,7 @@ def _run_epoch_policy_mixed(
             targets[is_puzzle, 0] = pad_id
 
         with _amp_ctx(device):
-            logits = model(input_tokens, batch_planes, attention_mask=input_mask)
+            logits = model(input_tokens, input_planes, attention_mask=input_mask)
             B, T, V = logits.shape
             ce = F.cross_entropy(
                 logits.reshape(-1, V),
@@ -910,8 +911,9 @@ def eval_policy(model, loader, device, pad_id: int) -> dict:
             batch_planes = batch_planes.to(device)
             input_tokens = batch_tokens[:, :-1]
             input_mask = batch_mask[:, :-1]
+            input_planes = batch_planes[:, :-1]
             targets = batch_tokens[:, 1:].contiguous()
-            logits = model(input_tokens, batch_planes, attention_mask=input_mask)
+            logits = model(input_tokens, input_planes, attention_mask=input_mask)
             flat_logits = logits.reshape(-1, logits.size(-1))
             flat_targets = targets.reshape(-1)
             valid = flat_targets != pad_id
@@ -950,7 +952,8 @@ def eval_puzzle_solve_rate(model, loader, device, pad_id: int) -> dict:
             batch_planes = batch_planes.to(device)
             input_tokens = batch_tokens[:, :-1]
             input_mask = batch_mask[:, :-1]
-            logits = model(input_tokens, batch_planes, attention_mask=input_mask)
+            input_planes = batch_planes[:, :-1]
+            logits = model(input_tokens, input_planes, attention_mask=input_mask)
             seq_len = batch_tokens.size(1)
             # Solver logit positions: 1, 3, 5, ... → target positions: 2, 4, 6, ...
             for solver_logit_pos in range(1, seq_len - 1, 2):
