@@ -37,7 +37,7 @@ amateur (~1800+) Lichess players, using only supervised learning on:
 - Stockfish-labeled positions (for reward model training)
 - High-quality Lichess puzzles (for tactical sharpness)
 
-No reinforcement learning, no self-play, no MCTS — the goal was to see how
+No reinforcement learning, no self-play, no MCTS as the goal was to see how
 far a purely-supervised transformer can be pushed on chess.
 
 ### Why transformers
@@ -139,8 +139,7 @@ self-attention over move history, learning patterns like "when castling is
 available and king-side is weak, play O-O-O" without having to score every
 sub-tree of move options.
 
-This is also closer in spirit to Deepmind's policy network trained in the paper *Grandmaster-Level Chess Without Search*, but trained
-purely on human games rather than self-play.
+This is also closer in spirit to Deepmind's policy network trained in the paper *Grandmaster-Level Chess Without Search*
 
 ### V3: CNN board encoder, pooled (Experiment 5)
 
