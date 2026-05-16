@@ -1,14 +1,20 @@
 #!/usr/bin/env python3
 """Pygame chess demo — drag pieces to play against GptForChess.
 
-Defaults to the canonical Experiment 4 checkpoints. Run from repo root with no
-arguments to use them, or override any path explicitly:
+Defaults to the Experiment 6 policy model (CNN + per-position cross-attention,
+live-board planes) paired with the Experiment 4 reward model for the eval bar.
+Run from repo root with no arguments, or override any path explicitly:
 
     PYTHONPATH=src poetry run python demo.py
     PYTHONPATH=src poetry run python demo.py \
-        --policy-model experiments/experiment_4/policy_model_phase2a.pt \
+        --policy-model experiments/experiment_6/policy_model.pt \
         --reward-model experiments/experiment_4/reward_model.pt \
         --tokenizer data/tokenizer.pt
+
+The Exp 6 policy model is meaningfully slower on CPU than earlier checkpoints
+because the CNN runs once per position in the move history (one forward per
+ply). Expect 1–3 s per AI move at mid-game depth; pass `--device cuda` or
+`--device mps` if you have an accelerator handy.
 """
 import sys
 import os
@@ -220,10 +226,12 @@ def promote_dialog(surf, label_font, color: chess.Color) -> chess.PieceType:
 def parse_args():
     parser = argparse.ArgumentParser(description='GptForChess pygame demo')
     parser.add_argument('--policy-model', type=str,
-                        default='experiments/experiment_5/policy_model.pt',
+                        default='experiments/experiment_6/policy_model_epoch_01.pt',
                         help='Path to ChessPolicyModel state_dict (used to choose AI moves). '
-                             'Defaults to the Phase 2a checkpoint from Experiment 4 — the strong '
-                             'games-only baseline (top-1 65.4%, top-5 81.9%).')
+                             'Must be an Experiment-6-compatible checkpoint (CNN + cross-attention '
+                             'architecture). Pre-Exp-6 checkpoints will fail to load. Pass the '
+                             'final policy_model.pt once training completes, or a per-epoch '
+                             'snapshot (policy_model_epoch_NN.pt) for mid-training testing.')
     parser.add_argument('--reward-model', type=str,
                         default='experiments/experiment_4/reward_model.pt',
                         help='Path to ChessRewardModel state_dict (used for the eval bar). '
@@ -266,11 +274,33 @@ def main():
     reward_fn = RewardModelInference(reward_model, tokenizer, device=args.device)
 
     policy_model = ChessPolicyModel(vocab_size=tokenizer.language_size)
-    policy_model.load_state_dict(
-        torch.load(args.policy_model, map_location=args.device, weights_only=False)
-    )
+    try:
+        policy_model.load_state_dict(
+            torch.load(args.policy_model, map_location=args.device, weights_only=False)
+        )
+    except RuntimeError as e:
+        # Pre-Exp-6 checkpoints were trained against a different architecture
+        # (TransformerEncoder, no cross-attention blocks, no per-square embedding).
+        # Surface a clear message instead of a cryptic key-mismatch traceback.
+        print(
+            f"\nFailed to load policy model from {args.policy_model}.\n"
+            f"This is most likely an architecture mismatch: the demo now expects "
+            f"an Experiment-6-style checkpoint (CNN + CrossAttnBlock + cross_gate). "
+            f"Original error:\n  {e}\n"
+        )
+        sys.exit(1)
     policy_model.eval()
     policy_fn = PolicyModelInference(policy_model, tokenizer, device=args.device)
+    print(
+        f"Policy model loaded ({sum(p.numel() for p in policy_model.parameters()) / 1e6:.1f}M params), "
+        f"device={args.device}"
+    )
+    # Diagnostic: show the cross-attention gate values so we can tell whether
+    # this checkpoint has actually learned to use the board pathway. All zeros
+    # means an extremely-early-training snapshot (cross-attn still disabled).
+    gates = [blk.cross_gate.tanh().item() for blk in policy_model.blocks]
+    gate_summary = "  ".join(f"L{i}={v:+.3f}" for i, v in enumerate(gates))
+    print(f"  cross_gate (tanh per layer):  {gate_summary}")
 
     board        = chess.Board()
 
