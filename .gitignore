@@ -24,6 +24,7 @@ build/
 # Training artifacts
 runs/
 *.pt
+!model/*.pt
 loss_curve.png
 
 # Claude Code

@@ -226,17 +226,17 @@ def promote_dialog(surf, label_font, color: chess.Color) -> chess.PieceType:
 def parse_args():
     parser = argparse.ArgumentParser(description='GptForChess pygame demo')
     parser.add_argument('--policy-model', type=str,
-                        default='experiments/experiment_6/policy_model_epoch_01.pt',
+                        default='model/policy_model.pt',
                         help='Path to ChessPolicyModel state_dict (used to choose AI moves). '
                              'Must be an Experiment-6-compatible checkpoint (CNN + cross-attention '
                              'architecture). Pre-Exp-6 checkpoints will fail to load. Pass the '
                              'final policy_model.pt once training completes, or a per-epoch '
                              'snapshot (policy_model_epoch_NN.pt) for mid-training testing.')
     parser.add_argument('--reward-model', type=str,
-                        default='experiments/experiment_4/reward_model.pt',
+                        default='model/reward_model.pt',
                         help='Path to ChessRewardModel state_dict (used for the eval bar). '
                              'Defaults to the Experiment 4 reward model.')
-    parser.add_argument('--tokenizer', type=str, default='data/tokenizer.pt',
+    parser.add_argument('--tokenizer', type=str, default='model/tokenizer.pt',
                         help='Path to the shared Tokenizer object')
     parser.add_argument('--device', type=str, default='cpu',
                         help='Torch device for inference (cpu / cuda / mps)')

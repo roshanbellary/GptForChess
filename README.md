@@ -17,9 +17,13 @@ the architecture progressed from a vanilla
 transformer encoder evaluating move sequences, through puzzle-augmented
 training, to the current Experiment 6 design, a CNN that produces 64
 per-square board feature vectors, cross-attended by a stack of transformer
-blocks that consume the move history. The current training run targets ~20
-epochs at roughly 2 hours per epoch on a rented H100 / RTX PRO 6000 Blackwell,
-for a **total training budget of approximately 40 hours**.
+blocks that consume the move history. The final training run completed
+11 epochs at roughly 2 hours per epoch on a rented RTX PRO 6000 Blackwell
+(**~24 hours total wall-clock**, with loss curves clearly plateauing by
+epoch 9–10) and achieved the project's strongest results to date:
+**73.1% test top-1 accuracy** on Lichess game continuations, **92.6%
+top-5**, and **55.08% puzzle first-move solve rate** (4.3× improvement
+over Experiment 5).
 
 This document is the consolidated project report. Each experiment also has its
 own analysis writeup in `experiments/experiment_N/analysis.md` under the repository.
@@ -407,7 +411,7 @@ Two limitations identified for Experiment 6:
 1. The CNN pooled to one vector which is an **information bottleneck**.
 2. The board was static (frozen at position 0) giving a **staleness bottleneck** that became worse as the game progressed. This meant model was forced to learn how to evaluate board state from moves taken. We can do better than that
 
-### Experiment 6 — Cross-attention + live boards (in progress)
+### Experiment 6 — Cross-attention + live boards
 
 Experiment 6 fixes both Experiment 5 limitations simultaneously:
 
@@ -453,20 +457,63 @@ Experiment 5 ran in 2.3 hours; Experiment 6's 40-hour budget reflects the
 combined cost of (a) per-position CNN evaluation, (b) cross-attention
 inside each transformer block, and (c) running 20 epochs instead of 12.
 
-**Status at time of writing:** training in progress. Epoch 1 metrics
-(policy_test loss = 1.27, top-1 = 66.2%, puzzle first_move = 22.1%) are
-ahead of Experiment 5's 12-epoch baseline, but the `cross_gate` values
-are still small (~0.03–0.10), suggesting the cross-attention pathway has
-just started to open. The training run also logs per-block gate values to
-TensorBoard each epoch, so the cross-attention engagement can be
-monitored as it climbs.
+**Results.** Training completed at epoch 11 (loss curves clearly
+plateaued by epoch 9–10, marginal improvement thereafter so purposefully stopped training). At a price of 95 cents per hour, training cost was **\$24.38**. Trained using the Vast service with a rented GPU.
 
-Per-epoch policy model checkpoints (`policy_model_epoch_NN.pt`) are saved
-for later evaluation across the training trajectory.
+| Metric | Exp 5 (ep 12) | Exp 6 (ep 11) |
+|---|---|---|
+| Train epoch loss | 0.8473 | **0.3992** |
+| Test policy loss | 1.5965 | **0.8710** |
+| Test perplexity | 4.96 | **2.39** |
+| Test top-1 | 63.6% | **73.1%** |
+| Test top-5 | 78.7% | **92.6%** |
+| Puzzle first-move | 12.67% | **55.08%** |
+| Puzzle all-moves | 68.25% | **85.63%** |
+| Train/test gap | 0.75 | 0.47 (narrower) |
 
-See `experiments/experiment_6/analysis.md` for the full procedure section
-including architectural rationale, data pipeline details, memory analysis,
-and code-change summary.
+Step-changes across every dimension. Puzzle first-move quadrupled
+(12.67% → 55.08%), game top-1 jumped 9.5 pp, perplexity halved. The
+train/test gap actually *narrowed* despite the increased model
+capacity indicating the live-board cross-attention is generalizing rather than
+memorizing.
+
+![Test policy loss](experiments/experiment_6/test_mixed_policy_loss.png)
+![Test policy top-1](experiments/experiment_6/test_mixed_policy_top1_acc.png)
+![Test policy top-5](experiments/experiment_6/test_mixed_policy_top5_acc.png)
+![Test policy perplexity](experiments/experiment_6/test_mixed_policy_perplexity.png)
+![Puzzle first-move solve](experiments/experiment_6/test_mixed_puzzle_first_move.png)
+![Puzzle all-moves solve](experiments/experiment_6/test_mixed_puzzle_all_moves.png)
+![Train epoch loss](experiments/experiment_6/train_policy_epoch_loss.png)
+![Train batch loss](experiments/experiment_6/train_policy_batch_loss.png)
+
+**Cross-attention gate dynamics had unexpected divergence.** The
+Flamingo-style gates (initialized to 0) did not all climb together.
+At end of training the per-block `tanh(α)` values were:
+
+| Block | tanh(gate) |
+|---|---|
+| L0 | **−0.259** |
+| L1 | +0.276 |
+| L2 | **+0.348** (largest +) |
+| L3 | +0.336 |
+| L4 | **−0.370** (largest −) |
+| L5 | −0.306 |
+| L6 | +0.304 |
+| L7 | −0.249 |
+
+![Cross-gate values per block over training](experiments/experiment_6/cross_gate.png)
+
+The first block went strongly negative; the early-middle blocks
+(L1–L3) went strongly positive; the deep blocks oscillated (L4–L5
+negative, L6 positive, L7 negative). Negative gates mean the
+cross-attention residual is *subtracted* from the move stream rather
+than added meaning those blocks have learned to use the board signal as
+an "anti-feature". The structured alternation suggests some
+form of emergent depth-wise normalization between additive and
+subtractive board injections. This warrants future investigation the ideas of which are contained in the further steps section 
+
+See `experiments/experiment_6/analysis.md` for the full procedure
+section, results breakdown, and gate-pattern discussion.
 
 ---
 
@@ -490,7 +537,7 @@ better-targeted dataset, decisively beat the earlier two-phase approaches.
 | Exp 4 Phase 2a | 65.4% | 81.9% | 0.1% | games only |
 | Exp 4 Phase 2b | 51.3% | 61.8% | 3.6% | puzzle FT broke games |
 | Exp 5 (CNN+mixed) | 64.0% | 79.5% | 12.67% | CNN pooled board, 12 ep |
-| Exp 6 (in progress) | 66.2% (epoch 1) | 83.9% (epoch 1) | 22.1% (epoch 1) | live boards + cross-attn |
+| **Exp 6 (live + cross-attn)** | **73.1%** | **92.6%** | **55.08%** | live boards + cross-attn, ep 11 |
 
 ### Subjective play quality
 
@@ -500,7 +547,11 @@ better-targeted dataset, decisively beat the earlier two-phase approaches.
   blunders pieces in endgame.
 - Experiment 5 (policy + CNN board): notable improvement over Exp 4 in
   reduced blunders and better tactical decisions.
-- Experiment 6: too early to judge since training in progress and will take 40 hours to finish 😭
+- Experiment 6 (live boards + cross-attention): the clearest
+  architectural win of the project. With the corrected tokenizer
+  loaded for inference, the model picks sensible opening moves,
+  navigates middlegames with real tactical awareness, and solves
+  ~55% of held-out Lichess puzzles outright at top-1.
 
 ---
 
@@ -525,7 +576,7 @@ experiments/
 deployment.md         Vast.ai workflow: rent → build → train → fetch
 ```
 
-### Key command reference(for Mac/ARM 64 systems specifically)
+### Key command reference
 
 ```bash
 # Build datasets (Experiment 6 mode — no Stockfish, much faster)
@@ -543,8 +594,10 @@ PYTHONPATH=src python src/train.py \
     --log-dir runs/exp6
 
 # Play against the model
-arch -arm64 poetry run python demo.py \
-    --policy-model {{path to policy model}} 
+arch -arm64 PYTHONPATH=src poetry run python demo.py \
+    --policy-model {{path to policy model}} \
+    --reward-model {{path to reward model}} \
+    --tokenizer {{path to tokenizer}} \
 ```
 
 ---
@@ -583,18 +636,21 @@ arch -arm64 poetry run python demo.py \
 
 ### Open questions for future experiments
 
-- Do the cross-attention gates climb to meaningful values (≥0.3) by
-  the end of Experiment 6, indicating the model genuinely uses the
-  board pathway? Or do they stay near zero, meaning the move history
-  is doing all the work? Also which ones turn negative per each layer?
-- Does Experiment 6 close Experiment 5's train/test gap, or widen it
-  further due to per-position memorization? The gap is the key signal
-  for whether to lower puzzle loss weight in a hypothetical Experiment 7.
-- Is the architecture data-bound or compute-bound? Experiment 4's
-  reward model was capacity-bound (test MSE < train MSE → underfit).
-  Whether the policy model is similarly underfit will determine
-  whether scale (d_model = 1024+) or data (more puzzles, more games)
-  is the next investment.
+- **Cross-attention gate divergence — why the signs split.** The gates
+  did not climb monotonically; they diverged into a structured
+  alternating pattern across depth, with L0 and L4–L5 + L7 going
+  *negative* (cross-attention residual subtracted from move stream)
+  and L1–L3 + L6 going positive. Negative gates mean the model is
+  using the board signal as an anti-feature to suppress spurious
+  history-only patterns. Was thinking of a direct ablation (forcing individual
+  gates to 0 and measuring per-metric impact) which would identify which
+  blocks are load-bearing for which capabilities.
+- **Is the architecture now data-bound or capacity-bound?** Train
+  loss 0.40 vs test loss 0.87 leans toward the model having room to
+  generalize better with more data, but the loss curves clearly
+  plateaued meaning more epochs at the same configuration won't help.
+  d_model = 1024 or num_layers = 12, plus more puzzles, is the
+  most plausible next investment.
 
 ---
 
@@ -610,5 +666,4 @@ arch -arm64 poetry run python demo.py \
 
 ---
 
-*Last updated: May 2026. Training of Experiment 6 in progress; this document
-will be revised with the final 20-epoch results once that run completes.*
+*Last updated: May 2026. Experiment 6 training complete at epoch 11.

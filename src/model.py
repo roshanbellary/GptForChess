@@ -299,20 +299,17 @@ class PolicyModelInference:
         self.model.eval()
     
     @torch.no_grad()
-    def __call__(self, board: chess.Board, max_seq_len: int = 128) -> str:
-        moves_uci = [move.uci() for move in board.move_stack][-(max_seq_len - 1):]
+    def __call__(self, board: chess.Board) -> str:
+        moves_uci = [move.uci() for move in board.move_stack]
         token_ids = [self.cls_id] + self.tokenizer.encode_moves(moves_uci)
         token_tensor = torch.tensor([token_ids], dtype=torch.long, device=self.device)
 
-        # Build (1, T, 19, 8, 8) per-position planes matching the training-time
-        # leak-safe layout: planes[0, t] is the board state after the first t
-        # *kept* moves have been played. If the history was truncated to fit
-        # max_seq_len, we replay the dropped moves onto a fresh board first so
-        # planes[0, 0] reflects the right starting state for the kept window.
+        # Replay the full move history on a fresh board, snapshotting planes
+        # at every position. planes[0] = standard starting board (model has
+        # only seen [CLS]); planes[t] = state after the first t moves played.
+        # This matches the training pipeline (ChessPolicyDataset._replay_planes
+        # with start_board=chess.Board()) exactly.
         replay_board = chess.Board()
-        n_skipped = len(board.move_stack) - len(moves_uci)
-        for m in board.move_stack[:n_skipped]:
-            replay_board.push(m)
         plane_list = [board_to_planes(replay_board)]
         for uci in moves_uci:
             replay_board.push(chess.Move.from_uci(uci))
